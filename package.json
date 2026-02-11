@@ -1,0 +1,27 @@
+{
+  "name": "flux-adaptor",
+  "version": "0.1.0",
+  "description": "Nostr-native gateway to Fluxbase - access your backend via HTTP or Nostr relays",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "bun run --watch src/index.ts",
+    "start": "bun run src/index.ts",
+    "cli": "bun run src/cli/setup-app.ts",
+    "init": "bun run src/cli/init-db.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@contextvm/sdk": "^0.2.5",
+    "@modelcontextprotocol/sdk": "^1.11.0",
+    "@noble/hashes": "^1.7.1",
+    "@noble/secp256k1": "^2.2.3",
+    "hono": "^4.7.4",
+    "nostr-tools": "^2.10.4",
+    "zod": "^3.24.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.3"
+  }
+}
