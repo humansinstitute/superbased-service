@@ -249,4 +249,6 @@ export interface DelegatedFetchParams {
   collection?: string;
   limit?: number;
   cursor?: string;
+  /** Hex pubkey of the record owner — scopes results to a single user */
+  ownerPubkey?: string;
 }

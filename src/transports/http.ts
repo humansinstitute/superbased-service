@@ -8,7 +8,25 @@ import { getOrCreateFluxbaseUser, generateFluxbaseJwt } from '../auth/user-mappi
 import { FluxbaseClient } from '../fluxbase/client';
 import { appsService } from '../services/apps';
 import { recordsService } from '../services/records';
-import type { AuthContext, SyncRecordInput } from '../types';
+import { usersService } from '../services/users';
+import { delegationsService } from '../services/delegations';
+import type { AuthContext, SyncRecordInput, CreateDelegationInput } from '../types';
+
+/**
+ * Resolve app npub to pubkey hex.
+ * App registration is optional - any valid npub can be used as a namespace.
+ */
+function resolveAppPubkey(appNpub: string): { pubkey: string } {
+  try {
+    const decoded = nip19.decode(appNpub);
+    if (decoded.type !== 'npub') {
+      throw new Error('Invalid npub: wrong type');
+    }
+    return { pubkey: decoded.data as string };
+  } catch (err) {
+    throw new Error(`Invalid app npub format: ${err}`);
+  }
+}
 
 // Extend Hono context with auth
 declare module 'hono' {
@@ -53,6 +71,26 @@ export function createHttpServer() {
 
     if (!authHeader) {
       return c.json({ error: 'Missing Authorization header' }, 401);
+    }
+
+    // Check for Bearer token (SERVICE_TOKEN auth)
+    if (authHeader.startsWith('Bearer ')) {
+      const token = authHeader.slice(7); // Remove 'Bearer ' prefix
+
+      if (config.serviceToken && token === config.serviceToken) {
+        // Service token auth - create admin context
+        const auth: AuthContext = {
+          pubkey: 'service',
+          npub: 'service',
+          isAdmin: true,
+          isServiceToken: true,
+        };
+        c.set('auth', auth);
+        await next();
+        return;
+      }
+
+      return c.json({ error: 'Invalid service token' }, 401);
     }
 
     // Get full URL for verification
@@ -391,6 +429,108 @@ export function createHttpServer() {
     }
   });
 
+  // ==================== Delegation Routes ====================
+
+  // Grant delegation to another pubkey
+  app.post('/apps/:appNpub/delegate', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+
+    // Check user access
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    // Resolve app npub
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    let input: CreateDelegationInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!input.delegate_npub || !input.permissions) {
+      return c.json({ error: 'delegate_npub and permissions required' }, 400);
+    }
+
+    try {
+      const result = await delegationsService.grantDelegation(appPubkey, auth, input);
+      return c.json(result, result.created ? 201 : 200);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // List delegations granted by the authenticated user
+  app.get('/apps/:appNpub/delegations', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+
+    // Check user access
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    // Resolve app npub
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    try {
+      const delegations = await delegationsService.listDelegations(appPubkey, auth);
+      return c.json({ delegations });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // Revoke a delegation
+  app.delete('/apps/:appNpub/delegate/:delegateNpub', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const delegateNpub = c.req.param('delegateNpub');
+
+    // Check user access
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    // Resolve app npub
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    try {
+      const revoked = await delegationsService.revokeDelegation(appPubkey, auth, delegateNpub);
+      if (revoked) {
+        return c.json({ success: true });
+      } else {
+        return c.json({ error: 'Delegation not found or already revoked' }, 404);
+      }
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
   // ==================== Record Sync Routes ====================
 
   // Sync records
@@ -398,9 +538,19 @@ export function createHttpServer() {
     const auth = c.get('auth');
     const appNpub = c.req.param('appNpub');
 
-    const appInfo = await appsService.getAppByNpub(appNpub);
-    if (!appInfo) {
-      return c.json({ error: 'App not found' }, 404);
+    // Check user access (balance > 0 OR whitelist = true)
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    // Resolve app npub (registration is optional)
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
     }
 
     let records: SyncRecordInput[];
@@ -416,27 +566,96 @@ export function createHttpServer() {
     }
 
     try {
-      const result = await recordsService.syncRecords(appInfo.app_pubkey, auth, records);
+      const result = await recordsService.syncRecords(appPubkey, auth, records);
       return c.json(result);
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }
   });
 
-  // Fetch records
-  app.get('/records/:appNpub/fetch', authMiddleware, async (c) => {
+  // ==================== DER Delegate Endpoint ====================
+
+  // Fetch records delegated to the caller (DER pull endpoint)
+  app.get('/records/:appNpub/delegated', authMiddleware, async (c) => {
     const auth = c.get('auth');
     const appNpub = c.req.param('appNpub');
-    const { collection, since } = c.req.query();
+    const { since, collection, limit, cursor, owner } = c.req.query();
 
-    const appInfo = await appsService.getAppByNpub(appNpub);
-    if (!appInfo) {
-      return c.json({ error: 'App not found' }, 404);
+    if (!owner) {
+      return c.json({ error: 'owner query parameter is required (hex pubkey)' }, 400);
+    }
+
+    // Check user access
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    // Resolve app npub
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
     }
 
     try {
+      const result = await recordsService.fetchDelegatedRecords(
+        appPubkey,
+        auth.pubkey,
+        {
+          since,
+          collection,
+          limit: limit ? parseInt(limit) : undefined,
+          cursor,
+          ownerPubkey: owner,
+        }
+      );
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // ==================== Record Fetch Routes ====================
+
+  // Fetch records (own records or delegated records with ?delegate=true)
+  app.get('/records/:appNpub/fetch', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const { collection, since, delegate } = c.req.query();
+
+    // Check user access (balance > 0 OR whitelist = true)
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    // Resolve app npub (registration is optional)
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    try {
+      // If delegate=true, fetch records where user is a delegate
+      if (delegate === 'true') {
+        const result = await recordsService.fetchRecordsForDelegate(
+          appPubkey,
+          auth.pubkey,
+          collection,
+          since
+        );
+        return c.json(result);
+      }
+
+      // Default: fetch user's own records
       const result = await recordsService.fetchRecords(
-        appInfo.app_pubkey,
+        appPubkey,
         auth,
         collection,
         since
@@ -453,9 +672,19 @@ export function createHttpServer() {
     const appNpub = c.req.param('appNpub');
     const { record_ids } = c.req.query();
 
-    const appInfo = await appsService.getAppByNpub(appNpub);
-    if (!appInfo) {
-      return c.json({ error: 'App not found' }, 404);
+    // Check user access (balance > 0 OR whitelist = true)
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    // Resolve app npub (registration is optional)
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
     }
 
     const ids = record_ids?.split(',') || [];
@@ -464,7 +693,7 @@ export function createHttpServer() {
     }
 
     try {
-      const deleted = await recordsService.deleteRecords(appInfo.app_pubkey, auth, ids);
+      const deleted = await recordsService.deleteRecords(appPubkey, auth, ids);
       return c.json({ deleted });
     } catch (err) {
       return c.json({ error: String(err) }, 500);

@@ -345,12 +345,16 @@ export class RecordsService {
     const config = getConfig();
     const client = new FluxbaseClient(config.fluxbaseServiceKey);
 
-    const { since, collection, limit = 100, cursor } = params;
+    const { since, collection, limit = 100, cursor, ownerPubkey } = params;
 
     // Build base filter for app
     const filter: Record<string, unknown> = {
       app_pubkey: appPubkey,
     };
+
+    if (ownerPubkey) {
+      filter.user_pubkey = ownerPubkey;
+    }
 
     if (collection) {
       filter.collection = collection;
