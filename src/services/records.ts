@@ -69,16 +69,23 @@ export class RecordsService {
         }
 
         // Update existing record (keep original owner)
+        // Merge metadata: incoming fields override, but existing fields are preserved
+        const existingMetadata = (existingRecord.metadata as Record<string, unknown>) || {};
+        const incomingMetadata = (record.metadata as Record<string, unknown>) || {};
+        const mergedMetadata = { ...existingMetadata, ...incomingMetadata };
+
         const updateData: Record<string, unknown> = {
           encrypted_data: record.encrypted_data,
-          collection: record.collection || 'default',
-          metadata: record.metadata || {},
+          collection: record.collection || existingRecord.collection || 'default',
+          metadata: mergedMetadata,
           updated_at: new Date().toISOString(),
         };
 
-        // DER v1: delegate_payloads map format (preferred)
-        if ((record as any).delegate_payloads && Object.keys((record as any).delegate_payloads).length > 0) {
-          updateData.delegate_payloads = (record as any).delegate_payloads;
+        // DER v1: delegate_payloads — merge incoming with existing (add/update, never remove)
+        const existingDelegatePayloads = (existingRecord.delegate_payloads as Record<string, string>) || {};
+        const incomingDelegatePayloads = ((record as any).delegate_payloads as Record<string, string>) || {};
+        if (Object.keys(incomingDelegatePayloads).length > 0 || Object.keys(existingDelegatePayloads).length > 0) {
+          updateData.delegate_payloads = { ...existingDelegatePayloads, ...incomingDelegatePayloads };
         }
 
         // Legacy v0: delegates array format
