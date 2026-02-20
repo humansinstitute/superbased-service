@@ -1,115 +1,106 @@
-import { FluxbaseClient } from '../fluxbase/client';
-import { getConfig } from '../config';
+import { getDb } from '../db/postgres';
 import { delegationsService } from './delegations';
 import type {
   AuthContext,
-  SyncRecordInput,
-  SyncResult,
-  FetchResult,
-  RecordOutput,
-  DelegatedRecordOutput,
-  DelegatedFetchResult,
-  DelegatedFetchParams,
+  SyncRecordInputV3,
+  SyncResultV3,
+  FetchResultV3,
+  RecordOutputV3,
+  DelegatedRecordOutputV3,
+  DelegatedFetchResultV3,
+  HistoryResultV3,
+  HistoryVersionV3,
 } from '../types';
 
-// Shared table for all app records
-const RECORDS_TABLE = 'superbased_records_v2';
+const TABLE = 'superbased_records_v3';
 
 /**
- * Service for syncing and fetching encrypted records
+ * Service for v3 append-only versioned encrypted records
  */
 export class RecordsService {
   /**
-   * Sync records (upsert) to shared records table
-   * Includes permission checking for delegated writes
+   * Sync records — append-only versioned upsert with atomic CTE
    */
   async syncRecords(
     appPubkey: string,
     auth: AuthContext,
-    records: SyncRecordInput[]
-  ): Promise<SyncResult> {
-    const config = getConfig();
-    // Use service key for record operations
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
-
+    records: SyncRecordInputV3[]
+  ): Promise<SyncResultV3> {
+    const sql = getDb();
+    const synced: { record_id: string; version: number }[] = [];
+    const rejected: { record_id: string; reason: string }[] = [];
     let created = 0;
     let updated = 0;
-    let denied = 0;
 
     for (const record of records) {
-      // Check if record exists (could be owned by signer or someone else)
-      const existing = await client.query({
-        table: RECORDS_TABLE,
-        filter: {
-          app_pubkey: appPubkey,
-          record_id: record.record_id,
-        },
-        limit: 1,
-      });
+      // Find existing live or deleted row
+      const existing = await sql`
+        SELECT version, record_state, user_pubkey
+        FROM ${sql(TABLE)}
+        WHERE app_pubkey = ${appPubkey}
+          AND record_id = ${record.record_id}
+          AND record_state IN ('live', 'deleted')
+        ORDER BY version DESC
+        LIMIT 1
+      `;
 
-      if (existing.data?.length) {
-        const existingRecord = existing.data[0] as any;
-        const recordOwner = existingRecord.user_pubkey;
+      if (existing.length > 0) {
+        const row = existing[0];
 
-        // Check write permission (includes DER v1 write_delegates check)
-        const assignedTo = (existingRecord.metadata?.assigned_to as string) ||
-                          (record.metadata?.assigned_to as string);
-        const writeDelegates = (existingRecord.metadata?.write_delegates as string[]) || [];
-        const permission = await delegationsService.checkWritePermission(
-          appPubkey,
-          auth.pubkey,
-          recordOwner,
-          assignedTo,
-          writeDelegates
-        );
-
-        if (!permission.allowed) {
-          denied++;
+        // Deleted records are terminal
+        if (row.record_state === 'deleted') {
+          rejected.push({ record_id: record.record_id, reason: 'record_deleted' });
           continue;
         }
 
-        // Update existing record (keep original owner)
-        // Merge metadata: incoming fields override, but existing fields are preserved
-        const existingMetadata = (existingRecord.metadata as Record<string, unknown>) || {};
-        const incomingMetadata = (record.metadata as Record<string, unknown>) || {};
-        const mergedMetadata = { ...existingMetadata, ...incomingMetadata };
-
-        const updateData: Record<string, unknown> = {
-          encrypted_data: record.encrypted_data,
-          collection: record.collection || existingRecord.collection || 'default',
-          metadata: mergedMetadata,
-          updated_at: new Date().toISOString(),
-        };
-
-        // DER v1: delegate_payloads — merge incoming with existing (add/update, never remove)
-        const existingDelegatePayloads = (existingRecord.delegate_payloads as Record<string, string>) || {};
-        const incomingDelegatePayloads = ((record as any).delegate_payloads as Record<string, string>) || {};
-        if (Object.keys(incomingDelegatePayloads).length > 0 || Object.keys(existingDelegatePayloads).length > 0) {
-          updateData.delegate_payloads = { ...existingDelegatePayloads, ...incomingDelegatePayloads };
+        // Check write permission: owner or app-level delegation
+        const recordOwner = row.user_pubkey;
+        if (auth.pubkey !== recordOwner) {
+          const delegation = await delegationsService.getDelegation(
+            appPubkey,
+            recordOwner,
+            auth.pubkey
+          );
+          if (!delegation || !delegation.permissions.includes('write')) {
+            rejected.push({ record_id: record.record_id, reason: 'no_permission' });
+            continue;
+          }
         }
 
-        // Legacy v0: delegates array format
-        if (record.delegates && record.delegates.length > 0) {
-          updateData.delegates = record.delegates;
-        }
+        // Atomic CTE: supersede current live row and insert new version
+        const result = await sql`
+          WITH superseded AS (
+            UPDATE ${sql(TABLE)}
+            SET record_state = 'superseded'
+            WHERE app_pubkey = ${appPubkey}
+              AND record_id = ${record.record_id}
+              AND record_state = 'live'
+            RETURNING version, user_pubkey
+          )
+          INSERT INTO ${sql(TABLE)} (
+            app_pubkey, record_id, user_pubkey, version, record_state,
+            collection, encrypted_data, encrypted_from, delegate_payloads
+          )
+          SELECT
+            ${appPubkey},
+            ${record.record_id},
+            user_pubkey,
+            version + 1,
+            'live',
+            ${record.collection || 'default'},
+            ${record.encrypted_data},
+            ${record.encrypted_from},
+            ${record.delegate_payloads ? sql.json(record.delegate_payloads) : null}
+          FROM superseded
+          RETURNING version
+        `;
 
-        const updateResult = await client.update({
-          table: RECORDS_TABLE,
-          filter: {
-            app_pubkey: appPubkey,
-            record_id: record.record_id,
-          },
-          data: updateData,
-        });
-
-        if (updateResult.error) {
-          console.error(`[records] update failed for ${record.record_id}:`, updateResult.error);
-        } else {
+        if (result.length > 0) {
+          synced.push({ record_id: record.record_id, version: result[0].version });
           updated++;
         }
       } else {
-        // Insert new record
-        // If owner_pubkey is provided and differs from signer, check app-level delegation
+        // New record — check delegation if owner_pubkey differs from signer
         let recordOwner = auth.pubkey;
         if (record.owner_pubkey && record.owner_pubkey !== auth.pubkey) {
           const delegation = await delegationsService.getDelegation(
@@ -120,365 +111,267 @@ export class RecordsService {
           if (delegation && delegation.permissions.includes('write')) {
             recordOwner = record.owner_pubkey;
           } else {
-            denied++;
+            rejected.push({ record_id: record.record_id, reason: 'no_permission' });
             continue;
           }
         }
 
-        const insertData: Record<string, unknown> = {
-          app_pubkey: appPubkey,
-          user_pubkey: recordOwner,
-          record_id: record.record_id,
-          collection: record.collection || 'default',
-          encrypted_data: record.encrypted_data,
-          metadata: record.metadata || {},
-        };
+        const result = await sql`
+          INSERT INTO ${sql(TABLE)} (
+            app_pubkey, record_id, user_pubkey, version, record_state,
+            collection, encrypted_data, encrypted_from, delegate_payloads
+          ) VALUES (
+            ${appPubkey},
+            ${record.record_id},
+            ${recordOwner},
+            1,
+            'live',
+            ${record.collection || 'default'},
+            ${record.encrypted_data},
+            ${record.encrypted_from},
+            ${record.delegate_payloads ? sql.json(record.delegate_payloads) : null}
+          )
+          RETURNING version
+        `;
 
-        // DER v1: delegate_payloads map format (preferred)
-        if ((record as any).delegate_payloads && Object.keys((record as any).delegate_payloads).length > 0) {
-          insertData.delegate_payloads = (record as any).delegate_payloads;
-        }
-
-        // Legacy v0: delegates array format
-        if (record.delegates && record.delegates.length > 0) {
-          insertData.delegates = record.delegates;
-        }
-
-        const insertResult = await client.insert({
-          table: RECORDS_TABLE,
-          data: insertData,
-        });
-
-        if (insertResult.error) {
-          console.error(`[records] insert failed for ${record.record_id}:`, insertResult.error);
-        } else {
-          created++;
-        }
+        synced.push({ record_id: record.record_id, version: result[0].version });
+        created++;
       }
     }
 
-    const result: SyncResult = { synced_count: created + updated, created, updated };
-    if (denied > 0) {
-      result.denied = denied;
-    }
-    return result;
+    return { synced, created, updated, rejected };
   }
 
   /**
-   * Fetch records with optional filters
+   * Fetch live records owned by the authenticated user.
+   * Optional limit/cursor for pagination (used by CVM transport to stay under NIP-44 size limits).
    */
   async fetchRecords(
     appPubkey: string,
     auth: AuthContext,
     collection?: string,
-    since?: string
-  ): Promise<FetchResult> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    since?: string,
+    limit?: number,
+    cursor?: string
+  ): Promise<FetchResultV3 & { cursor?: string; has_more?: boolean }> {
+    const sql = getDb();
 
-    const filter: Record<string, unknown> = {
-      app_pubkey: appPubkey,
-      user_pubkey: auth.pubkey,
-    };
+    // cursor acts as an upper bound (records older than cursor), since acts as lower bound
+    const fetchLimit = limit ? limit + 1 : undefined; // fetch one extra to detect has_more
 
-    if (collection) {
-      filter.collection = collection;
-    }
+    const rows = await sql`
+      SELECT record_id, version, collection, encrypted_data, encrypted_from,
+             delegate_payloads, created_at
+      FROM ${sql(TABLE)}
+      WHERE app_pubkey = ${appPubkey}
+        AND user_pubkey = ${auth.pubkey}
+        AND record_state = 'live'
+        ${collection ? sql`AND collection = ${collection}` : sql``}
+        ${since ? sql`AND created_at > ${since}` : sql``}
+        ${cursor ? sql`AND created_at < ${cursor}` : sql``}
+      ORDER BY created_at DESC
+      ${fetchLimit ? sql`LIMIT ${fetchLimit}` : sql``}
+    `;
 
-    if (since) {
-      filter.updated_at = { gt: since };
-    }
-
-    const result = await client.query({
-      table: RECORDS_TABLE,
-      filter,
-      order: { column: 'updated_at', ascending: false },
-    });
-
-    if (result.error) {
-      throw new Error(result.error);
-    }
-
-    const records: RecordOutput[] = (result.data || []).map((r: any) => {
-      const output: RecordOutput = {
+    const records: RecordOutputV3[] = rows.map((r: any) => {
+      const out: RecordOutputV3 = {
         record_id: r.record_id,
+        version: r.version,
         collection: r.collection,
         encrypted_data: r.encrypted_data,
-        metadata: r.metadata,
-        updated_at: r.updated_at,
+        encrypted_from: r.encrypted_from,
+        created_at: r.created_at,
       };
-      if (r.delegates && r.delegates.length > 0) {
-        output.delegates = r.delegates;
+      if (r.delegate_payloads && Object.keys(r.delegate_payloads).length > 0) {
+        out.delegate_payloads = r.delegate_payloads;
       }
-      return output;
+      return out;
     });
 
-    return { records };
-  }
+    // If we fetched limit+1 and got that many, there are more pages
+    const hasMore = limit ? records.length > limit : false;
+    if (hasMore) records.pop(); // remove the extra probe record
 
-  /**
-   * Fetch records as a delegate
-   * Returns records from owners who have granted read access
-   * AND records assigned to the delegate
-   */
-  async fetchRecordsForDelegate(
-    appPubkey: string,
-    delegatePubkey: string,
-    collection?: string,
-    since?: string
-  ): Promise<FetchResult> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
-
-    // Get all owners who have granted read access to this delegate
-    const ownersWithReadAccess = await delegationsService.getOwnersWithReadAccess(
-      appPubkey,
-      delegatePubkey
-    );
-
-    const allRecords: RecordOutput[] = [];
-
-    // Fetch records from each owner with read delegation
-    for (const ownerPubkey of ownersWithReadAccess) {
-      const filter: Record<string, unknown> = {
-        app_pubkey: appPubkey,
-        user_pubkey: ownerPubkey,
-      };
-
-      if (collection) {
-        filter.collection = collection;
-      }
-
-      if (since) {
-        filter.updated_at = { gt: since };
-      }
-
-      const result = await client.query({
-        table: RECORDS_TABLE,
-        filter,
-        order: { column: 'updated_at', ascending: false },
-      });
-
-      if (!result.error && result.data) {
-        const records = (result.data as any[]).map((r: any) => {
-          const output: RecordOutput = {
-            record_id: r.record_id,
-            collection: r.collection,
-            encrypted_data: r.encrypted_data,
-            metadata: r.metadata,
-            updated_at: r.updated_at,
-            owner_pubkey: r.user_pubkey,
-          };
-          if (r.delegates && r.delegates.length > 0) {
-            output.delegates = r.delegates;
-          }
-          return output;
-        });
-        allRecords.push(...records);
+    const result: FetchResultV3 & { cursor?: string; has_more?: boolean } = { records };
+    if (limit) {
+      result.has_more = hasMore;
+      if (hasMore && records.length > 0) {
+        result.cursor = records[records.length - 1].created_at;
       }
     }
 
-    // Also fetch records assigned specifically to this delegate
-    // Using raw SQL through the API is complex, so we'll fetch and filter
-    // This is a simplified approach - in production you'd want a proper query
-    const assignedResult = await client.query({
-      table: RECORDS_TABLE,
-      filter: {
-        app_pubkey: appPubkey,
-      },
-      order: { column: 'updated_at', ascending: false },
-    });
-
-    if (!assignedResult.error && assignedResult.data) {
-      for (const r of assignedResult.data as any[]) {
-        // Check if assigned to this delegate
-        const assignedTo = r.metadata?.assigned_to as string;
-        if (assignedTo === delegatePubkey) {
-          // Don't duplicate records already fetched via read delegation
-          const alreadyIncluded = allRecords.some(
-            existing => existing.record_id === r.record_id
-          );
-          if (!alreadyIncluded) {
-            // Apply collection filter if specified
-            if (collection && r.collection !== collection) {
-              continue;
-            }
-            // Apply since filter if specified
-            if (since && r.updated_at <= since) {
-              continue;
-            }
-
-            const output: RecordOutput = {
-              record_id: r.record_id,
-              collection: r.collection,
-              encrypted_data: r.encrypted_data,
-              metadata: r.metadata,
-              updated_at: r.updated_at,
-              owner_pubkey: r.user_pubkey,
-            };
-            if (r.delegates && r.delegates.length > 0) {
-              output.delegates = r.delegates;
-            }
-            allRecords.push(output);
-          }
-        }
-      }
-    }
-
-    // Sort by updated_at descending
-    allRecords.sort((a, b) =>
-      new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime()
-    );
-
-    return { records: allRecords };
+    return result;
   }
 
   /**
-   * Fetch records delegated to a specific pubkey (DER pull endpoint).
-   *
-   * Finds records where the delegate's pubkey appears in
-   * metadata.read_delegates or metadata.write_delegates.
-   *
-   * Privacy guarantees:
-   * - encrypted_data (owner's blob) is never returned
-   * - Only the requesting delegate's entry from delegate_payloads is returned
-   * - Other delegates' blobs are stripped
+   * Fetch records delegated to a specific pubkey.
+   * Uses GIN index on delegate_payloads for efficient lookup.
+   * Returns only the requesting delegate's payload — strips owner data and other delegates.
    */
   async fetchDelegatedRecords(
     appPubkey: string,
     delegatePubkey: string,
-    params: DelegatedFetchParams
-  ): Promise<DelegatedFetchResult> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    collection?: string,
+    ownerPubkey?: string,
+    limit?: number,
+    cursor?: string
+  ): Promise<DelegatedFetchResultV3 & { cursor?: string; has_more?: boolean }> {
+    const sql = getDb();
 
-    const { since, collection, limit = 100, cursor, ownerPubkey } = params;
+    const fetchLimit = limit ? limit + 1 : undefined; // fetch one extra to detect has_more
 
-    // Build base filter for app
-    const filter: Record<string, unknown> = {
-      app_pubkey: appPubkey,
-    };
+    const rows = await sql`
+      SELECT record_id, version, collection, user_pubkey, encrypted_from,
+             delegate_payloads, created_at
+      FROM ${sql(TABLE)}
+      WHERE app_pubkey = ${appPubkey}
+        AND record_state = 'live'
+        AND delegate_payloads ? ${delegatePubkey}
+        ${collection ? sql`AND collection = ${collection}` : sql``}
+        ${ownerPubkey ? sql`AND user_pubkey = ${ownerPubkey}` : sql``}
+        ${cursor ? sql`AND created_at < ${cursor}` : sql``}
+      ORDER BY created_at DESC
+      ${fetchLimit ? sql`LIMIT ${fetchLimit}` : sql``}
+    `;
 
-    if (ownerPubkey) {
-      filter.user_pubkey = ownerPubkey;
-    }
+    const records: DelegatedRecordOutputV3[] = rows.map((r: any) => ({
+      record_id: r.record_id,
+      version: r.version,
+      collection: r.collection,
+      owner_pubkey: r.user_pubkey,
+      encrypted_from: r.encrypted_from,
+      delegate_payload: r.delegate_payloads[delegatePubkey],
+      created_at: r.created_at,
+    }));
 
-    if (collection) {
-      filter.collection = collection;
-    }
+    // If we fetched limit+1 and got that many, there are more pages
+    const hasMore = limit ? records.length > limit : false;
+    if (hasMore) records.pop();
 
-    if (since) {
-      filter.updated_at = { gt: since };
-    }
-
-    // If cursor is provided, use it as an offset-based pagination token
-    // Cursor format: "offset:<number>"
-    let offset = 0;
-    if (cursor) {
-      const parts = cursor.split(':');
-      if (parts[0] === 'offset' && parts[1]) {
-        offset = parseInt(parts[1], 10);
+    const result: DelegatedFetchResultV3 & { cursor?: string; has_more?: boolean } = { records };
+    if (limit) {
+      result.has_more = hasMore;
+      if (hasMore && records.length > 0) {
+        result.cursor = records[records.length - 1].created_at;
       }
     }
 
-    // Fetch records for this app — we filter delegate membership in JS
-    // because JSONB array containment queries aren't available through
-    // the simple PostgREST-style filter API
-    const result = await client.query({
-      table: RECORDS_TABLE,
-      filter,
-      order: { column: 'updated_at', ascending: false },
-    });
+    return result;
+  }
 
-    if (result.error) {
-      throw new Error(result.error);
-    }
+  /**
+   * Get full version history for a record
+   */
+  async getRecordHistory(
+    appPubkey: string,
+    recordId: string,
+    includeData?: boolean
+  ): Promise<HistoryResultV3 | null> {
+    const sql = getDb();
 
-    const allRecords = (result.data || []) as any[];
-    const matchingRecords: DelegatedRecordOutput[] = [];
+    const rows = await sql`
+      SELECT version, record_state, encrypted_from, created_at,
+             user_pubkey
+             ${includeData ? sql`, encrypted_data, delegate_payloads` : sql``}
+      FROM ${sql(TABLE)}
+      WHERE app_pubkey = ${appPubkey}
+        AND record_id = ${recordId}
+      ORDER BY version ASC
+    `;
 
-    for (const r of allRecords) {
-      const metadata = r.metadata || {};
-      const readDelegates: string[] = metadata.read_delegates || [];
-      const writeDelegates: string[] = metadata.write_delegates || [];
+    if (rows.length === 0) return null;
 
-      const isReadDelegate = readDelegates.includes(delegatePubkey);
-      const isWriteDelegate = writeDelegates.includes(delegatePubkey);
-
-      if (!isReadDelegate && !isWriteDelegate) {
-        continue;
-      }
-
-      // Extract only this delegate's payload
-      let delegatePayload: string | null = null;
-
-      // Check DER v1 map format first
-      if (r.delegate_payloads && typeof r.delegate_payloads === 'object') {
-        delegatePayload = r.delegate_payloads[delegatePubkey] || null;
-      }
-
-      // Fall back to legacy v0 array format
-      if (!delegatePayload && Array.isArray(r.delegates)) {
-        const entry = r.delegates.find(
-          (d: any) => d.delegate_pubkey === delegatePubkey
-        );
-        if (entry) {
-          delegatePayload = entry.encrypted_blob;
+    const versions: HistoryVersionV3[] = rows.map((r: any) => {
+      const v: HistoryVersionV3 = {
+        version: r.version,
+        record_state: r.record_state,
+        encrypted_from: r.encrypted_from,
+        created_at: r.created_at,
+      };
+      if (includeData) {
+        v.encrypted_data = r.encrypted_data;
+        if (r.delegate_payloads) {
+          v.delegate_payloads = r.delegate_payloads;
         }
       }
-
-      // Skip records where the delegate has no encrypted blob available
-      if (!delegatePayload) {
-        continue;
-      }
-
-      matchingRecords.push({
-        record_id: r.record_id,
-        collection: r.collection,
-        owner_pubkey: r.user_pubkey,
-        access: isWriteDelegate ? 'write' : 'read',
-        metadata,
-        delegate_payload: delegatePayload,
-        updated_at: r.updated_at,
-      });
-    }
-
-    // Apply offset + limit pagination
-    const page = matchingRecords.slice(offset, offset + limit);
-    const hasMore = offset + limit < matchingRecords.length;
-    const nextCursor = hasMore ? `offset:${offset + limit}` : null;
+      return v;
+    });
 
     return {
-      records: page,
-      cursor: nextCursor,
+      record_id: recordId,
+      owner_pubkey: rows[0].user_pubkey,
+      versions,
     };
   }
 
   /**
-   * Delete records by ID
+   * Delete a record — inserts a terminal "deleted" version
    */
-  async deleteRecords(
+  async deleteRecord(
     appPubkey: string,
     auth: AuthContext,
-    recordIds: string[]
-  ): Promise<number> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
-    let deleted = 0;
+    recordId: string
+  ): Promise<{ version: number } | null> {
+    const sql = getDb();
 
-    for (const recordId of recordIds) {
-      const result = await client.delete({
-        table: RECORDS_TABLE,
-        filter: {
-          app_pubkey: appPubkey,
-          user_pubkey: auth.pubkey,
-          record_id: recordId,
-        },
-      });
-      if (!result.error) deleted++;
+    // Find existing live row
+    const existing = await sql`
+      SELECT version, record_state, user_pubkey
+      FROM ${sql(TABLE)}
+      WHERE app_pubkey = ${appPubkey}
+        AND record_id = ${recordId}
+        AND record_state IN ('live', 'deleted')
+      ORDER BY version DESC
+      LIMIT 1
+    `;
+
+    if (existing.length === 0) return null;
+
+    const row = existing[0];
+    if (row.record_state === 'deleted') return null;
+
+    // Check ownership
+    if (auth.pubkey !== row.user_pubkey) {
+      const delegation = await delegationsService.getDelegation(
+        appPubkey,
+        row.user_pubkey,
+        auth.pubkey
+      );
+      if (!delegation || !delegation.permissions.includes('write')) {
+        return null;
+      }
     }
 
-    return deleted;
+    // Atomic CTE: supersede live row and insert deleted version
+    const result = await sql`
+      WITH superseded AS (
+        UPDATE ${sql(TABLE)}
+        SET record_state = 'superseded'
+        WHERE app_pubkey = ${appPubkey}
+          AND record_id = ${recordId}
+          AND record_state = 'live'
+        RETURNING version, user_pubkey
+      )
+      INSERT INTO ${sql(TABLE)} (
+        app_pubkey, record_id, user_pubkey, version, record_state,
+        collection, encrypted_data, encrypted_from, delegate_payloads
+      )
+      SELECT
+        ${appPubkey},
+        ${recordId},
+        user_pubkey,
+        version + 1,
+        'deleted',
+        'default',
+        '',
+        '',
+        null
+      FROM superseded
+      RETURNING version
+    `;
+
+    if (result.length === 0) return null;
+    return { version: result[0].version };
   }
 }
 

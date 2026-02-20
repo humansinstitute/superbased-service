@@ -9,15 +9,18 @@
     "start": "bun run src/index.ts",
     "cli": "bun run src/cli/setup-app.ts",
     "init": "bun run src/cli/init-db.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "bun test src/__tests__/",
+    "prune": "bun run src/cli/prune-records.ts"
   },
   "dependencies": {
-    "@contextvm/sdk": "^0.2.5",
+    "@contextvm/sdk": "0.2.10",
     "@modelcontextprotocol/sdk": "^1.11.0",
     "@noble/hashes": "^1.7.1",
     "@noble/secp256k1": "^2.2.3",
     "hono": "^4.7.4",
     "nostr-tools": "^2.10.4",
+    "postgres": "^3.4.8",
     "zod": "^3.24.0"
   },
   "devDependencies": {

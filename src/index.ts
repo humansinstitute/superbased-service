@@ -76,6 +76,9 @@ async function main() {
   console.log('  Functions:');
   console.log(`    POST /functions/:name      - Invoke edge function`);
   console.log('');
+  console.log('  DER Delegate (pull):');
+  console.log(`    GET  /records/:app/delegated - Fetch records delegated to caller`);
+  console.log('');
   console.log('  Health:');
   console.log(`    GET  /health               - Service health (no auth)`);
   console.log('');
@@ -85,7 +88,7 @@ async function main() {
   console.log('');
   console.log('  auth_whoami, db_query, db_insert, db_update, db_delete,');
   console.log('  storage_upload, storage_download, storage_list, storage_delete,');
-  console.log('  function_invoke, health');
+  console.log('  function_invoke, fetch_delegated_records, health');
   console.log('');
   console.log('═══════════════════════════════════════════════════════════');
   console.log('');

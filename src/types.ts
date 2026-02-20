@@ -121,46 +121,73 @@ export interface RegisterResult {
   created: boolean;
 }
 
-// ==================== RECORD SYNC TYPES ====================
-
-// Delegate encryption entry - one per delegate who can read this record
-export interface DelegateEncryption {
-  delegate_pubkey: string;    // Delegate's pubkey (hex or npub)
-  encrypted_blob: string;     // NIP-44 encrypted payload for this delegate
-}
+// ==================== RECORD SYNC TYPES (v3) ====================
 
 // Input for syncing a single record
-export interface SyncRecordInput {
-  record_id: string;          // Client-provided ID
-  collection?: string;        // Optional collection name (default: 'default')
-  encrypted_data: string;     // NIP-44 encrypted payload (owner's copy)
-  delegates?: DelegateEncryption[]; // Encrypted copies for each delegate
-  metadata?: Record<string, unknown>; // Can include assigned_to for per-record delegation
-  owner_pubkey?: string;      // Actual owner pubkey (hex) — used when a delegate creates on behalf of an owner
+export interface SyncRecordInputV3 {
+  record_id: string;
+  encrypted_data: string;
+  encrypted_from: string;
+  collection?: string;
+  delegate_payloads?: Record<string, string>;
+  owner_pubkey?: string;
 }
 
 // Result from sync operation
-export interface SyncResult {
-  synced_count: number;
+export interface SyncResultV3 {
+  synced: { record_id: string; version: number }[];
   created: number;
   updated: number;
-  denied?: number; // Records denied due to permission check
+  rejected: { record_id: string; reason: string }[];
 }
 
-// Record as returned from fetch
-export interface RecordOutput {
+// Record as returned from fetch (owner's view)
+export interface RecordOutputV3 {
   record_id: string;
+  version: number;
   collection: string;
   encrypted_data: string;
-  delegates?: DelegateEncryption[]; // Encrypted copies for delegates
-  metadata: Record<string, unknown>;
-  updated_at: string;
-  owner_pubkey?: string; // Included when fetching as delegate
+  encrypted_from: string;
+  delegate_payloads?: Record<string, string>;
+  created_at: string;
 }
 
-// Result from fetch operation
-export interface FetchResult {
-  records: RecordOutput[];
+// Result from fetch
+export interface FetchResultV3 {
+  records: RecordOutputV3[];
+}
+
+// Record as returned to a delegate via /delegated
+export interface DelegatedRecordOutputV3 {
+  record_id: string;
+  version: number;
+  collection: string;
+  owner_pubkey: string;
+  encrypted_from: string;
+  delegate_payload: string;
+  created_at: string;
+}
+
+// Result from delegated fetch
+export interface DelegatedFetchResultV3 {
+  records: DelegatedRecordOutputV3[];
+}
+
+// Single version entry in history
+export interface HistoryVersionV3 {
+  version: number;
+  record_state: string;
+  encrypted_from: string;
+  created_at: string;
+  encrypted_data?: string;
+  delegate_payloads?: Record<string, string>;
+}
+
+// Result from history endpoint
+export interface HistoryResultV3 {
+  record_id: string;
+  owner_pubkey: string;
+  versions: HistoryVersionV3[];
 }
 
 // ==================== TOKEN TYPES ====================
@@ -224,31 +251,3 @@ export interface WritePermissionResult {
   reason?: string;
 }
 
-// ==================== DER DELEGATED FETCH TYPES ====================
-
-// Record as returned to a delegate via /delegated endpoint
-export interface DelegatedRecordOutput {
-  record_id: string;
-  collection: string;
-  owner_pubkey: string;
-  access: 'read' | 'write';
-  metadata: Record<string, unknown>;
-  delegate_payload: string;       // Only this delegate's NIP-44 blob
-  updated_at: string;
-}
-
-// Result from delegated fetch
-export interface DelegatedFetchResult {
-  records: DelegatedRecordOutput[];
-  cursor: string | null;
-}
-
-// Params for delegated fetch
-export interface DelegatedFetchParams {
-  since?: string;
-  collection?: string;
-  limit?: number;
-  cursor?: string;
-  /** Hex pubkey of the record owner — scopes results to a single user */
-  ownerPubkey?: string;
-}

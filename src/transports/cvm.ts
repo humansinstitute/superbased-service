@@ -24,7 +24,7 @@ import { getOrCreateFluxbaseUser, generateFluxbaseJwt } from '../auth/user-mappi
 import { FluxbaseClient } from '../fluxbase/client';
 import { appsService } from '../services/apps';
 import { recordsService } from '../services/records';
-import type { AuthContext, SyncRecordInput } from '../types';
+import type { AuthContext, SyncRecordInputV3 } from '../types';
 
 // MCP Server instance
 let mcpServer: McpServer | null = null;
@@ -68,10 +68,51 @@ async function getAuthFromExtra(extra: unknown): Promise<AuthContext> {
 /**
  * Helper to create JSON content response for MCP
  */
+// NIP-44 plaintext limit is 65535 bytes; MCP protocol framing adds overhead.
+// Keep payload under this to avoid encryption failures.
+const CVM_MAX_PAYLOAD_BYTES = 60000;
+
 function jsonContent(data: unknown) {
+  const text = JSON.stringify(data);
   return {
-    content: [{ type: 'text' as const, text: JSON.stringify(data) }],
+    content: [{ type: 'text' as const, text }],
   };
+}
+
+/**
+ * Build a paginated records response that fits within NIP-44 limits.
+ * Progressively drops records from the end until the payload fits.
+ */
+function paginatedJsonContent(
+  records: any[],
+  hasMore: boolean,
+  cursorField: string = 'created_at'
+) {
+  let slice = records;
+  let adjustedHasMore = hasMore;
+
+  while (slice.length > 0) {
+    const result: any = { records: slice };
+    result.has_more = adjustedHasMore || slice.length < records.length;
+    if (result.has_more && slice.length > 0) {
+      result.cursor = slice[slice.length - 1][cursorField];
+    }
+
+    const text = JSON.stringify(result);
+    const byteLen = new TextEncoder().encode(text).length;
+
+    if (byteLen <= CVM_MAX_PAYLOAD_BYTES) {
+      return { content: [{ type: 'text' as const, text }] };
+    }
+
+    // Too large — drop the last record and mark has_more
+    slice = slice.slice(0, -1);
+    adjustedHasMore = true;
+  }
+
+  // Empty result
+  const text = JSON.stringify({ records: [], has_more: hasMore });
+  return { content: [{ type: 'text' as const, text }] };
 }
 
 /**
@@ -395,84 +436,149 @@ function registerTools(server: McpServer) {
     }
   );
 
-  // ==================== Record Sync Tools ====================
+  // ==================== Record Sync Tools (v3) ====================
 
   // Sync records
   server.tool(
     'sync_records',
-    'Sync encrypted records to app storage',
+    'Sync encrypted records to app storage (append-only versioned)',
     {
       app_npub: z.string().describe('App npub to sync to'),
       records: z.array(z.object({
         record_id: z.string(),
+        encrypted_data: z.string().describe('NIP-44 ciphertext encrypted to the owner'),
+        encrypted_from: z.string().describe('Hex pubkey of whoever encrypted the data'),
         collection: z.string().optional(),
-        encrypted_data: z.string(),
-        metadata: z.record(z.unknown()).optional(),
+        delegate_payloads: z.record(z.string()).optional().describe('Map of delegate hex pubkey to NIP-44 encrypted blob'),
+        owner_pubkey: z.string().optional().describe('Owner hex pubkey — for delegate-on-behalf writes'),
       })).describe('Records to sync'),
     },
     async (params, extra) => {
       const auth = await getAuthFromExtra(extra);
-      const appInfo = await appsService.getAppByNpub(params.app_npub);
-      if (!appInfo) {
-        throw new Error('App not found');
-      }
+
+      const decoded = nip19.decode(params.app_npub);
+      if (decoded.type !== 'npub') throw new Error('Invalid app_npub');
+      const appPubkey = decoded.data as string;
 
       const result = await recordsService.syncRecords(
-        appInfo.app_pubkey,
+        appPubkey,
         auth,
-        params.records as SyncRecordInput[]
+        params.records as SyncRecordInputV3[]
       );
       return jsonContent(result);
     }
   );
 
-  // Fetch records
+  // Fetch records (paginated for CVM — NIP-44 has 64KB plaintext limit)
   server.tool(
     'fetch_records',
-    'Fetch encrypted records from app storage',
+    'Fetch own live encrypted records from app storage. Paginated: use cursor from previous response to get next page.',
     {
       app_npub: z.string().describe('App npub to fetch from'),
       collection: z.string().optional().describe('Filter by collection'),
-      since: z.string().optional().describe('Fetch records updated after this ISO timestamp'),
+      since: z.string().optional().describe('Only records created after this ISO timestamp'),
+      limit: z.number().optional().describe('Max records per page (default 10, max 50)'),
+      cursor: z.string().optional().describe('Pagination cursor from previous response'),
     },
     async (params, extra) => {
       const auth = await getAuthFromExtra(extra);
-      const appInfo = await appsService.getAppByNpub(params.app_npub);
-      if (!appInfo) {
-        throw new Error('App not found');
-      }
 
+      const decoded = nip19.decode(params.app_npub);
+      if (decoded.type !== 'npub') throw new Error('Invalid app_npub');
+      const appPubkey = decoded.data as string;
+
+      const limit = Math.min(params.limit || 10, 50);
       const result = await recordsService.fetchRecords(
-        appInfo.app_pubkey,
+        appPubkey,
         auth,
         params.collection,
-        params.since
+        params.since,
+        limit,
+        params.cursor
       );
+      return paginatedJsonContent(result.records, result.has_more ?? false);
+    }
+  );
+
+  // Fetch delegated records (paginated for CVM — NIP-44 has 64KB plaintext limit)
+  server.tool(
+    'fetch_delegated_records',
+    'Fetch records delegated to the caller. Returns only the requesting delegate\'s encrypted blob — owner blobs and other delegates\' blobs are stripped. Paginated: use cursor from previous response to get next page.',
+    {
+      app_npub: z.string().describe('App npub to fetch delegated records from'),
+      collection: z.string().optional().describe('Filter by collection name'),
+      owner: z.string().optional().describe('Filter by owner hex pubkey'),
+      limit: z.number().optional().describe('Max records per page (default 10, max 50)'),
+      cursor: z.string().optional().describe('Pagination cursor from previous response'),
+    },
+    async (params, extra) => {
+      const auth = await getAuthFromExtra(extra);
+
+      const decoded = nip19.decode(params.app_npub);
+      if (decoded.type !== 'npub') throw new Error('Invalid app_npub');
+      const appPubkey = decoded.data as string;
+
+      const limit = Math.min(params.limit || 10, 50);
+      const result = await recordsService.fetchDelegatedRecords(
+        appPubkey,
+        auth.pubkey,
+        params.collection,
+        params.owner,
+        limit,
+        params.cursor
+      );
+      return paginatedJsonContent(result.records, result.has_more ?? false);
+    }
+  );
+
+  // Delete record (inserts terminal deleted version)
+  server.tool(
+    'delete_record',
+    'Delete a record (inserts a terminal deleted version)',
+    {
+      app_npub: z.string().describe('App npub'),
+      record_id: z.string().describe('Record ID to delete'),
+    },
+    async (params, extra) => {
+      const auth = await getAuthFromExtra(extra);
+
+      const decoded = nip19.decode(params.app_npub);
+      if (decoded.type !== 'npub') throw new Error('Invalid app_npub');
+      const appPubkey = decoded.data as string;
+
+      const result = await recordsService.deleteRecord(appPubkey, auth, params.record_id);
+      if (!result) {
+        throw new Error('Record not found or already deleted');
+      }
       return jsonContent(result);
     }
   );
 
-  // Delete records
+  // Record history
   server.tool(
-    'delete_records',
-    'Delete records from app storage',
+    'get_record_history',
+    'Get full version history for a record (all versions, all states)',
     {
       app_npub: z.string().describe('App npub'),
-      record_ids: z.array(z.string()).describe('Record IDs to delete'),
+      record_id: z.string().describe('Record ID'),
+      include_data: z.boolean().optional().describe('Include encrypted_data and delegate_payloads in response'),
     },
     async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const appInfo = await appsService.getAppByNpub(params.app_npub);
-      if (!appInfo) {
-        throw new Error('App not found');
-      }
+      await getAuthFromExtra(extra); // Require auth
 
-      const deleted = await recordsService.deleteRecords(
-        appInfo.app_pubkey,
-        auth,
-        params.record_ids
+      const decoded = nip19.decode(params.app_npub);
+      if (decoded.type !== 'npub') throw new Error('Invalid app_npub');
+      const appPubkey = decoded.data as string;
+
+      const result = await recordsService.getRecordHistory(
+        appPubkey,
+        params.record_id,
+        params.include_data
       );
-      return jsonContent({ deleted });
+      if (!result) {
+        throw new Error('Record not found');
+      }
+      return jsonContent(result);
     }
   );
 }

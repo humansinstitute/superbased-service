@@ -19,6 +19,10 @@ export interface Config {
   // Security
   adminNpubs: string[];
   nip98MaxAgeSeconds: number;
+  serviceToken: string | null;
+
+  // Postgres (direct connection for records v3)
+  postgresUrl: string;
 
   // Logging
   logLevel: 'debug' | 'info' | 'warn' | 'error';
@@ -78,6 +82,10 @@ export function loadConfig(): Config {
     // Security
     adminNpubs,
     nip98MaxAgeSeconds: parseInt(getEnvOptional('NIP98_MAX_AGE_SECONDS', '60'), 10),
+    serviceToken: process.env.SERVICE_TOKEN || null,
+
+    // Postgres
+    postgresUrl: getEnvOptional('POSTGRES_URL', 'postgres://postgres:postgres@localhost:5432/fluxbase'),
 
     // Logging
     logLevel: getEnvOptional('LOG_LEVEL', 'info') as Config['logLevel'],

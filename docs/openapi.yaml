@@ -1,0 +1,1284 @@
+openapi: 3.1.0
+info:
+  title: Flux Adaptor API
+  version: 0.1.0
+  description: |
+    Nostr-native gateway to Fluxbase. Provides access to database, storage,
+    edge functions, app registration, record sync, and delegated record access.
+
+    ## Authentication
+
+    All protected endpoints require one of two auth methods:
+
+    ### NIP-98 (Nostr HTTP Auth)
+    Sign a kind 27235 event containing the request URL and method, then pass it
+    as `Authorization: Nostr <base64-event>`.
+
+    ```
+    Authorization: Nostr eyJraW5kIjoyNzIzNSwi...
+    ```
+
+    The event must:
+    - Be signed by the caller's Nostr key
+    - Contain `["u", "<request-url>"]` and `["method", "<HTTP-METHOD>"]` tags
+    - Be less than 60 seconds old
+    - Optionally include `["payload", "<sha256-hex-of-body>"]` for POST/PUT/PATCH
+
+    ### Service Token (admin)
+    Pass a pre-shared service token as a Bearer token:
+    ```
+    Authorization: Bearer <SERVICE_TOKEN>
+    ```
+    Grants admin access; intended for server-to-server calls only.
+
+    ## Transports
+
+    The same operations are available over two transports:
+
+    | Transport | Protocol | Auth | Use case |
+    |-----------|----------|------|----------|
+    | HTTP | REST over HTTPS | NIP-98 or Bearer | Direct, fast |
+    | CVM | MCP tools over Nostr relays | Nostr encryption | Private, NAT-friendly |
+
+    This spec documents the HTTP transport. CVM exposes identical operations
+    as MCP tool calls (see `x-mcp-tool` annotations on each operation).
+
+    ## DER (Delegated Encrypted Records)
+
+    Records follow the DER specification for multi-recipient encrypted storage.
+    See the `/records/{appNpub}/delegated` endpoint for delegate access.
+
+  contact:
+    name: SuperBased
+  license:
+    name: MIT
+
+servers:
+  - url: '{protocol}://{host}:{port}'
+    description: Flux Adaptor instance
+    variables:
+      protocol:
+        default: http
+        enum: [http, https]
+      host:
+        default: localhost
+      port:
+        default: '3080'
+
+tags:
+  - name: Health
+    description: Service health checks (no auth required)
+  - name: Auth
+    description: Authentication and identity
+  - name: Database
+    description: Generic table CRUD (proxied to Fluxbase)
+  - name: Storage
+    description: File storage operations (proxied to Fluxbase)
+  - name: Functions
+    description: Edge function invocation (proxied to Fluxbase)
+  - name: Apps
+    description: App registry — register apps, generate tokens
+  - name: Delegations
+    description: App-level delegation management (grant/revoke/list)
+  - name: Records
+    description: Encrypted record sync and retrieval (DER-aware)
+
+security:
+  - nip98: []
+  - bearerServiceToken: []
+
+paths:
+  # ───────────────────── Health ─────────────────────
+  /health:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: Service health check
+      description: Returns adaptor status, server npub, and Fluxbase connectivity. No auth required.
+      x-mcp-tool: health
+      security: []
+      responses:
+        '200':
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  adaptor:
+                    type: string
+                    example: flux-adaptor
+                  serverNpub:
+                    type: string
+                    description: Server's Nostr npub (bech32)
+                    example: npub1qqqqqq...
+                  fluxbase:
+                    type: object
+                    properties:
+                      healthy:
+                        type: boolean
+                      details:
+                        type: object
+
+  # ───────────────────── Auth ─────────────────────
+  /auth/me:
+    get:
+      operationId: getAuthMe
+      tags: [Auth]
+      summary: Current user info
+      description: Returns the authenticated user's identity and Fluxbase mapping.
+      x-mcp-tool: auth_whoami
+      responses:
+        '200':
+          description: Authenticated user info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ───────────────────── Database ─────────────────────
+  /db/{table}:
+    parameters:
+      - $ref: '#/components/parameters/TableName'
+
+    get:
+      operationId: dbQuery
+      tags: [Database]
+      summary: Query records
+      description: |
+        Query rows from a Fluxbase table. Supports filtering via query parameters,
+        column selection, ordering, and pagination.
+
+        Filter syntax: any query parameter not named `select`, `order`, `limit`,
+        or `offset` is treated as an equality filter on that column.
+      x-mcp-tool: db_query
+      parameters:
+        - name: select
+          in: query
+          description: Comma-separated column names to return
+          schema:
+            type: string
+          example: id,name,created_at
+        - name: order
+          in: query
+          description: 'Column to order by. Append `.asc` or `.desc` (default: asc)'
+          schema:
+            type: string
+          example: created_at.desc
+        - name: limit
+          in: query
+          description: Maximum number of rows to return
+          schema:
+            type: integer
+            minimum: 1
+        - name: offset
+          in: query
+          description: Number of rows to skip
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      operationId: dbInsert
+      tags: [Database]
+      summary: Insert records
+      description: Insert one or more rows into a table. Returns the created record(s).
+      x-mcp-tool: db_insert
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  description: Single record
+                - type: array
+                  items:
+                    type: object
+                  description: Multiple records
+      responses:
+        '201':
+          description: Record(s) created
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    patch:
+      operationId: dbUpdate
+      tags: [Database]
+      summary: Update records
+      description: |
+        Update rows matching the query-parameter filter. At least one filter
+        parameter is required to prevent accidental full-table updates.
+      x-mcp-tool: db_update
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Fields to update
+      responses:
+        '200':
+          description: Updated record(s)
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    delete:
+      operationId: dbDelete
+      tags: [Database]
+      summary: Delete records
+      description: |
+        Delete rows matching the query-parameter filter. At least one filter
+        parameter is required to prevent accidental full-table deletes.
+      x-mcp-tool: db_delete
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                    example: true
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ───────────────────── Storage ─────────────────────
+  /storage/{bucket}:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+
+    get:
+      operationId: storageList
+      tags: [Storage]
+      summary: List files in a bucket
+      x-mcp-tool: storage_list
+      parameters:
+        - name: prefix
+          in: query
+          description: Filter files by path prefix
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        '200':
+          description: File listing
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /storage/{bucket}/{path}:
+    parameters:
+      - $ref: '#/components/parameters/BucketName'
+      - name: path
+        in: path
+        required: true
+        description: File path within the bucket
+        schema:
+          type: string
+
+    post:
+      operationId: storageUpload
+      tags: [Storage]
+      summary: Upload a file
+      description: Upload binary content to a storage bucket. Set `Content-Type` to the file's MIME type.
+      x-mcp-tool: storage_upload
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+          image/*:
+            schema:
+              type: string
+              format: binary
+      responses:
+        '201':
+          description: File uploaded
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    get:
+      operationId: storageDownload
+      tags: [Storage]
+      summary: Download a file
+      x-mcp-tool: storage_download
+      responses:
+        '200':
+          description: File content
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    delete:
+      operationId: storageDelete
+      tags: [Storage]
+      summary: Delete a file
+      x-mcp-tool: storage_delete
+      responses:
+        '200':
+          description: File deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ───────────────────── Functions ─────────────────────
+  /functions/{name}:
+    parameters:
+      - name: name
+        in: path
+        required: true
+        description: Edge function name
+        schema:
+          type: string
+
+    post:
+      operationId: invokeFunction
+      tags: [Functions]
+      summary: Invoke an edge function
+      x-mcp-tool: function_invoke
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Function payload (optional)
+      responses:
+        '200':
+          description: Function result
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ───────────────────── App Registry ─────────────────────
+  /apps:
+    get:
+      operationId: listApps
+      tags: [Apps]
+      summary: List apps owned by the authenticated user
+      x-mcp-tool: list_apps
+      responses:
+        '200':
+          description: App list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  apps:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AppInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /apps/register:
+    post:
+      operationId: registerApp
+      tags: [Apps]
+      summary: Register a new app
+      description: |
+        Register an app with an attestation event (kind 30079) signed by the
+        app's Nostr key. The attestation must reference this server's npub.
+        The caller must authenticate as the app (sign NIP-98 with the app's nsec).
+      x-mcp-tool: register_app
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, attestation]
+              properties:
+                name:
+                  type: string
+                  description: Human-readable app name
+                  example: super-based-todo
+                attestation:
+                  type: string
+                  description: Base64-encoded kind 30079 event signed by the app key
+      responses:
+        '201':
+          description: App registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /apps/{appNpub}:
+    parameters:
+      - $ref: '#/components/parameters/AppNpub'
+
+    get:
+      operationId: getApp
+      tags: [Apps]
+      summary: Get app info
+      x-mcp-tool: get_app
+      responses:
+        '200':
+          description: App info
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppInfo'
+        '404':
+          description: App not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /apps/{appNpub}/token:
+    parameters:
+      - $ref: '#/components/parameters/AppNpub'
+
+    post:
+      operationId: generateToken
+      tags: [Apps]
+      summary: Generate access token for an app
+      description: |
+        Generates a server-signed token (kind 30078) containing the app attestation,
+        relay, and HTTP endpoint. Only the app owner can generate tokens.
+        Clients present this token to discover and connect to the app.
+      x-mcp-tool: generate_token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                relay:
+                  type: string
+                  description: Relay URL for CVM access
+                  example: wss://relay.damus.io
+                http:
+                  type: string
+                  description: HTTP endpoint URL
+                  example: https://flux.example.com
+      responses:
+        '200':
+          description: Generated token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: Base64-encoded signed token event
+        '403':
+          description: Not app owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ───────────────────── Delegations ─────────────────────
+  /apps/{appNpub}/delegate:
+    parameters:
+      - $ref: '#/components/parameters/AppNpub'
+
+    post:
+      operationId: grantDelegation
+      tags: [Delegations]
+      summary: Grant app-level delegation
+      description: |
+        Grant read and/or write delegation to another Nostr pubkey for this app.
+        This is an **app-level** delegation — the delegate gains access to all
+        of the granter's records within the app.
+
+        For **per-record** delegation, use the DER `metadata.read_delegates` /
+        `metadata.write_delegates` fields when syncing records.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDelegationInput'
+      responses:
+        '201':
+          description: Delegation created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DelegationResult'
+        '200':
+          description: Delegation updated (already existed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DelegationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Access denied (user not whitelisted or no balance)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /apps/{appNpub}/delegations:
+    parameters:
+      - $ref: '#/components/parameters/AppNpub'
+
+    get:
+      operationId: listDelegations
+      tags: [Delegations]
+      summary: List delegations granted by the authenticated user
+      responses:
+        '200':
+          description: Active delegations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delegations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AppDelegation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Access denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /apps/{appNpub}/delegate/{delegateNpub}:
+    parameters:
+      - $ref: '#/components/parameters/AppNpub'
+      - name: delegateNpub
+        in: path
+        required: true
+        description: Delegate's npub (bech32)
+        schema:
+          type: string
+
+    delete:
+      operationId: revokeDelegation
+      tags: [Delegations]
+      summary: Revoke a delegation
+      description: Soft-revokes the delegation by setting `revoked_at`.
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '404':
+          description: Delegation not found or already revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Access denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ───────────────────── Record Sync ─────────────────────
+  /records/{appNpub}/sync:
+    parameters:
+      - $ref: '#/components/parameters/AppNpub'
+
+    post:
+      operationId: syncRecords
+      tags: [Records]
+      summary: Sync encrypted records (upsert)
+      description: |
+        Upserts encrypted records for the authenticated user within an app
+        namespace. Supports the DER record format with per-record delegation.
+
+        **Write permission rules** (checked per record):
+        1. Signer is record owner → allow
+        2. Signer has app-level "write" delegation from owner → allow
+        3. Signer matches `metadata.assigned_to` → allow
+        4. Signer's pubkey is in `metadata.write_delegates` → allow
+        5. Otherwise → deny (record counted in `denied`)
+
+        New records are always owned by the signer.
+      x-mcp-tool: sync_records
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [records]
+              properties:
+                records:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/SyncRecordInput'
+            example:
+              records:
+                - record_id: todo-550e8400-e29b-41d4-a716-446655440000
+                  collection: todos
+                  encrypted_payload: '<NIP-44 encrypted blob>'
+                  delegate_payloads:
+                    ab12cd34ef56: '<NIP-44 blob for delegate>'
+                  metadata:
+                    id: 550e8400-e29b-41d4-a716-446655440000
+                    owner: 'aabb...owner-hex'
+                    read_delegates: ['ab12cd34ef56']
+                    write_delegates: []
+                    schema_version: 1
+                    created_at: '2025-01-15T10:30:00Z'
+                    updated_at: '2025-01-15T10:30:00Z'
+      responses:
+        '200':
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Access denied (user not whitelisted or no balance)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /records/{appNpub}/fetch:
+    parameters:
+      - $ref: '#/components/parameters/AppNpub'
+
+    get:
+      operationId: fetchRecords
+      tags: [Records]
+      summary: Fetch own records (or delegated via app-level delegation)
+      description: |
+        Fetches the authenticated user's own records. Pass `delegate=true`
+        to fetch records from owners who have granted app-level delegation.
+
+        For **per-record** DER delegation, use `/records/{appNpub}/delegated`
+        instead — it filters by `metadata.read_delegates` / `write_delegates`
+        and strips owner blobs.
+      x-mcp-tool: fetch_records
+      parameters:
+        - name: collection
+          in: query
+          description: Filter by collection name
+          schema:
+            type: string
+        - name: since
+          in: query
+          description: Only return records updated after this ISO-8601 timestamp
+          schema:
+            type: string
+            format: date-time
+        - name: delegate
+          in: query
+          description: |
+            Set to `true` to fetch records via app-level delegation.
+            Returns records from owners who granted read access to the caller.
+          schema:
+            type: string
+            enum: ['true', 'false']
+      responses:
+        '200':
+          description: Records
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FetchResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Access denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /records/{appNpub}/delegated:
+    parameters:
+      - $ref: '#/components/parameters/AppNpub'
+
+    get:
+      operationId: fetchDelegatedRecords
+      tags: [Records]
+      summary: Fetch records delegated to the caller (DER pull endpoint)
+      description: |
+        **DER Delegate Endpoint** — the pull complement to the Nostr delegation
+        manifest (kind 30078 push).
+
+        Returns records where the NIP-98 signer's pubkey appears in
+        `metadata.read_delegates` OR `metadata.write_delegates`.
+
+        **Privacy guarantees:**
+        - `encrypted_payload` (owner's blob) is **never** returned
+        - Only the requesting delegate's entry from `delegate_payloads` is
+          included — other delegates' blobs are stripped
+        - `metadata` is returned in full (it's plaintext and needed for
+          client-side logic like `assigned_to`, `schema_version`, etc.)
+
+        **Intended consumers:** AI agents, bots, and shared-access clients
+        that were granted per-record access by record owners.
+
+        **Discovery flow:**
+        1. Delegate subscribes to Nostr relay for kind 30078 events tagged
+           `#p: [own_pubkey]`, `#t: ["der-delegation"]`
+        2. On receiving a manifest, decrypt to learn the SuperBased endpoint
+           and record IDs
+        3. Call this endpoint with NIP-98 auth to fetch encrypted blobs
+        4. Decrypt `delegate_payloads[own_pubkey]` using NIP-44
+      x-mcp-tool: fetch_delegated_records
+      parameters:
+        - name: since
+          in: query
+          description: |
+            Only return records with `updated_at` after this ISO-8601 timestamp.
+            Used for incremental sync (e.g., "what changed since my last poll?").
+          schema:
+            type: string
+            format: date-time
+          example: '2025-06-01T00:00:00Z'
+        - name: collection
+          in: query
+          description: Filter by collection name
+          schema:
+            type: string
+          example: todos
+        - name: limit
+          in: query
+          description: Maximum number of records to return (default 100)
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: cursor
+          in: query
+          description: |
+            Pagination cursor from a previous response. Opaque string —
+            pass it back verbatim to get the next page.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Delegated records for the caller
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DelegatedFetchResult'
+              example:
+                records:
+                  - record_id: todo-550e8400-e29b-41d4-a716-446655440000
+                    collection: todos
+                    owner_pubkey: aabb11...owner-hex
+                    access: read
+                    metadata:
+                      id: 550e8400-e29b-41d4-a716-446655440000
+                      owner: aabb11...owner-hex
+                      read_delegates: ['cc22dd33...delegate-hex']
+                      write_delegates: []
+                      schema_version: 1
+                      updated_at: '2025-06-15T12:00:00Z'
+                    delegate_payload: '<NIP-44 encrypted blob for this delegate>'
+                    updated_at: '2025-06-15T12:00:00Z'
+                cursor: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Access denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /records/{appNpub}:
+    parameters:
+      - $ref: '#/components/parameters/AppNpub'
+
+    delete:
+      operationId: deleteRecords
+      tags: [Records]
+      summary: Delete records by ID
+      description: |
+        Delete records owned by the authenticated user. Only the record owner
+        can delete; delegates cannot.
+      x-mcp-tool: delete_records
+      parameters:
+        - name: record_ids
+          in: query
+          required: true
+          description: Comma-separated record IDs to delete
+          schema:
+            type: string
+          example: todo-abc123,todo-def456
+      responses:
+        '200':
+          description: Deletion result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted:
+                    type: integer
+                    description: Number of records actually deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Access denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    nip98:
+      type: http
+      scheme: Nostr
+      description: |
+        NIP-98 HTTP Auth. Sign a kind 27235 event containing the request URL
+        and method, base64-encode it, and pass as `Authorization: Nostr <event>`.
+
+    bearerServiceToken:
+      type: http
+      scheme: bearer
+      description: |
+        Pre-shared service token for admin/server-to-server access.
+        Pass as `Authorization: Bearer <SERVICE_TOKEN>`.
+
+  parameters:
+    TableName:
+      name: table
+      in: path
+      required: true
+      description: Database table name
+      schema:
+        type: string
+      example: todos
+
+    BucketName:
+      name: bucket
+      in: path
+      required: true
+      description: Storage bucket name
+      schema:
+        type: string
+      example: avatars
+
+    AppNpub:
+      name: appNpub
+      in: path
+      required: true
+      description: App's Nostr npub (bech32 encoded)
+      schema:
+        type: string
+      example: npub1qqqqqq...
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Human-readable error message
+
+    AuthInfo:
+      type: object
+      properties:
+        npub:
+          type: string
+          description: User's npub (bech32)
+        pubkey:
+          type: string
+          description: User's hex public key
+        isAdmin:
+          type: boolean
+        fluxbaseUserId:
+          type: string
+          description: Mapped Fluxbase user ID
+
+    AppInfo:
+      type: object
+      properties:
+        app_pubkey:
+          type: string
+          description: App's Nostr pubkey (hex)
+        owner_pubkey:
+          type: string
+          description: Who registered the app (hex)
+        name:
+          type: string
+        schema_name:
+          type: string
+          description: Internal schema identifier (app_<hash>)
+        attestation_event:
+          type: string
+          description: Full signed registration event (JSON string)
+        created_at:
+          type: string
+          format: date-time
+
+    RegisterResult:
+      type: object
+      properties:
+        app_npub:
+          type: string
+        schema_name:
+          type: string
+        created:
+          type: boolean
+          description: true if newly registered, false if already existed
+
+    CreateDelegationInput:
+      type: object
+      required: [delegate_npub, permissions]
+      properties:
+        delegate_npub:
+          type: string
+          description: Delegate's npub (bech32)
+          example: npub1delegate...
+        permissions:
+          type: array
+          items:
+            type: string
+            enum: [read, write]
+          description: Permission levels to grant
+          example: [read, write]
+
+    AppDelegation:
+      type: object
+      properties:
+        id:
+          type: string
+        app_pubkey:
+          type: string
+        owner_pubkey:
+          type: string
+        delegate_pubkey:
+          type: string
+        permissions:
+          type: array
+          items:
+            type: string
+            enum: [read, write]
+        created_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    DelegationResult:
+      type: object
+      properties:
+        delegation:
+          $ref: '#/components/schemas/AppDelegation'
+        created:
+          type: boolean
+
+    # ─── DER Record Schemas ───
+
+    RecordMetadata:
+      type: object
+      description: |
+        Plaintext, server-queryable metadata. Follows DER v1 schema.
+      required: [id, owner, schema_version]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Unique record identifier
+        owner:
+          type: string
+          description: Record owner's hex pubkey
+        read_delegates:
+          type: array
+          items:
+            type: string
+          description: Hex pubkeys with read-only access
+          default: []
+        write_delegates:
+          type: array
+          items:
+            type: string
+          description: Hex pubkeys with read+write access
+          default: []
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        schema_version:
+          type: integer
+          description: Record format version (currently 1)
+          example: 1
+      additionalProperties: true
+
+    SyncRecordInput:
+      type: object
+      required: [record_id]
+      properties:
+        record_id:
+          type: string
+          description: Client-generated record ID
+          example: todo-550e8400-e29b-41d4-a716-446655440000
+        collection:
+          type: string
+          description: Collection/namespace (default "default")
+          default: default
+          example: todos
+        encrypted_payload:
+          type: string
+          description: NIP-44 encrypted blob for the record owner
+        encrypted_data:
+          type: string
+          description: |
+            **Legacy (v0).** Alias for `encrypted_payload`. If both are
+            present, `encrypted_payload` takes precedence.
+        delegate_payloads:
+          type: object
+          additionalProperties:
+            type: string
+          description: |
+            Map of delegate hex pubkey → NIP-44 encrypted blob.
+            Each delegate gets their own encrypted copy of the record.
+          example:
+            ab12cd34ef56: '<NIP-44 encrypted for this delegate>'
+        delegates:
+          type: array
+          items:
+            type: object
+            properties:
+              delegate_pubkey:
+                type: string
+              encrypted_blob:
+                type: string
+          description: |
+            **Legacy (v0).** Array form of delegate payloads.
+            Prefer `delegate_payloads` map for new code.
+        metadata:
+          $ref: '#/components/schemas/RecordMetadata'
+
+    SyncResult:
+      type: object
+      properties:
+        synced_count:
+          type: integer
+          description: Total records successfully synced
+        created:
+          type: integer
+        updated:
+          type: integer
+        denied:
+          type: integer
+          description: Records rejected due to permission checks (omitted if 0)
+
+    RecordOutput:
+      type: object
+      description: Record as returned from fetch (owner view)
+      properties:
+        record_id:
+          type: string
+        collection:
+          type: string
+        encrypted_payload:
+          type: string
+          description: Owner's NIP-44 encrypted blob
+        encrypted_data:
+          type: string
+          description: Legacy alias for encrypted_payload
+        delegate_payloads:
+          type: object
+          additionalProperties:
+            type: string
+          description: All delegate blobs (only in owner fetch)
+        delegates:
+          type: array
+          items:
+            type: object
+            properties:
+              delegate_pubkey:
+                type: string
+              encrypted_blob:
+                type: string
+          description: Legacy array form
+        metadata:
+          $ref: '#/components/schemas/RecordMetadata'
+        updated_at:
+          type: string
+          format: date-time
+        owner_pubkey:
+          type: string
+          description: Present when fetching as delegate
+
+    FetchResult:
+      type: object
+      properties:
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecordOutput'
+
+    DelegatedRecordOutput:
+      type: object
+      description: |
+        Record as returned to a delegate. Owner's encrypted_payload is
+        excluded. Only the requesting delegate's blob is included.
+      properties:
+        record_id:
+          type: string
+        collection:
+          type: string
+        owner_pubkey:
+          type: string
+          description: Record owner's hex pubkey
+        access:
+          type: string
+          enum: [read, write]
+          description: |
+            The requesting delegate's access level for this record.
+            "write" if pubkey is in write_delegates, "read" if in read_delegates.
+        metadata:
+          $ref: '#/components/schemas/RecordMetadata'
+        delegate_payload:
+          type: string
+          description: |
+            NIP-44 encrypted blob for **this delegate only**.
+            Decrypt with: `nip44.decrypt(own_secret, owner_pubkey, blob)`
+        updated_at:
+          type: string
+          format: date-time
+
+    DelegatedFetchResult:
+      type: object
+      properties:
+        records:
+          type: array
+          items:
+            $ref: '#/components/schemas/DelegatedRecordOutput'
+        cursor:
+          type: string
+          nullable: true
+          description: |
+            Pagination cursor. Pass to `?cursor=` to get the next page.
+            Null when there are no more results.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid authentication
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: Missing Authorization header
+
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
