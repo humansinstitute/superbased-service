@@ -1,6 +1,5 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { logger } from 'hono/logger';
 import { nip19 } from 'nostr-tools';
 import { getConfig } from '../config';
 import { verifyNip98, createAuthContext } from '../auth/nip98';
@@ -55,8 +54,18 @@ export function createHttpServer() {
     allowHeaders: ['Content-Type', 'Authorization'],
   }));
 
-  // Middleware: Logger
-  app.use('*', logger());
+  // Middleware: request logging
+  // Keep logs high-signal: log non-GET requests and any error responses.
+  app.use('*', async (c, next) => {
+    const start = Date.now();
+    await next();
+    const method = c.req.method;
+    const status = c.res.status;
+    if (method !== 'GET' || status >= 400) {
+      const ms = Date.now() - start;
+      console.log(`${method} ${c.req.path} -> ${status} (${ms}ms)`);
+    }
+  });
 
   // Health check (no auth required)
   app.get('/health', async (c) => {
