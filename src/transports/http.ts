@@ -1,16 +1,22 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { logger } from 'hono/logger';
 import { nip19 } from 'nostr-tools';
 import { getConfig } from '../config';
 import { verifyNip98, createAuthContext } from '../auth/nip98';
-import { getOrCreateFluxbaseUser, generateFluxbaseJwt } from '../auth/user-mapping';
-import { FluxbaseClient } from '../fluxbase/client';
+import { getDb } from '../db/postgres';
 import { appsService } from '../services/apps';
 import { recordsService } from '../services/records';
 import { usersService } from '../services/users';
 import { delegationsService } from '../services/delegations';
-import type { AuthContext, SyncRecordInputV3, CreateDelegationInput } from '../types';
+import { pushService } from '../services/push';
+import { renderConnectionUiHtml } from './webui';
+import type {
+  AuthContext,
+  SyncRecordInputV3,
+  CreateDelegationInput,
+  PushSubscriptionUpsertInput,
+  PushSubscriptionDeleteInput,
+} from '../types';
 
 /**
  * Resolve app npub to pubkey hex.
@@ -28,11 +34,23 @@ function resolveAppPubkey(appNpub: string): { pubkey: string } {
   }
 }
 
+// App-less namespace: use server pubkey as a stable global namespace.
+function resolveDefaultNamespacePubkey(): string {
+  const config = getConfig();
+  return config.serverPublicKey;
+}
+
 // Extend Hono context with auth
 declare module 'hono' {
   interface ContextVariableMap {
     auth: AuthContext;
   }
+}
+
+function isNoisySuccessPath(path: string): boolean {
+  if (/^\/records\/[^/]+\/sync$/.test(path)) return true;
+  if (/^\/apps\/[^/]+\/push(\/|$)/.test(path)) return true;
+  return false;
 }
 
 /**
@@ -49,20 +67,44 @@ export function createHttpServer() {
     allowHeaders: ['Content-Type', 'Authorization'],
   }));
 
-  // Middleware: Logger
-  app.use('*', logger());
+  // Middleware: request logging
+  // Keep logs high-signal: log non-GET requests and any error responses,
+  // except high-volume successful sync/push routes.
+  app.use('*', async (c, next) => {
+    const start = Date.now();
+    await next();
+    const method = c.req.method;
+    const status = c.res.status;
+    const path = c.req.path;
+    const skipNoisySuccess = status < 400 && isNoisySuccessPath(path);
+    if (!skipNoisySuccess && (method !== 'GET' || status >= 400)) {
+      const ms = Date.now() - start;
+      console.log(`${method} ${path} -> ${status} (${ms}ms)`);
+    }
+  });
 
   // Health check (no auth required)
   app.get('/health', async (c) => {
     const config = getConfig();
-    const client = new FluxbaseClient();
-    const health = await client.health();
+    let dbHealthy = false;
+    try {
+      const sql = getDb();
+      await sql`SELECT 1`;
+      dbHealthy = true;
+    } catch {
+      // db unreachable
+    }
     return c.json({
-      status: 'ok',
-      adaptor: 'flux-adaptor',
+      status: dbHealthy ? 'ok' : 'degraded',
+      adaptor: 'superbased-service',
       serverNpub: nip19.npubEncode(config.serverPublicKey),
-      fluxbase: health,
+      postgres: { healthy: dbHealthy },
     });
+  });
+
+  // Simple built-in UI for key/token generation
+  app.get('/ui', async (c) => {
+    return c.html(renderConnectionUiHtml());
   });
 
   // NIP-98 Auth middleware for protected routes
@@ -102,8 +144,6 @@ export function createHttpServer() {
     if (['POST', 'PUT', 'PATCH'].includes(method)) {
       try {
         body = await c.req.text();
-        // Re-create the request with the body for downstream handlers
-        // Note: Hono caches the body, so we need to handle this carefully
       } catch {
         body = undefined;
       }
@@ -117,13 +157,7 @@ export function createHttpServer() {
     }
 
     // Create auth context
-    let auth = createAuthContext(result.pubkey);
-
-    // Get or create Fluxbase user
-    auth = await getOrCreateFluxbaseUser(auth);
-
-    // Generate JWT for Fluxbase requests
-    auth.fluxbaseJwt = await generateFluxbaseJwt(auth) ?? undefined;
+    const auth = createAuthContext(result.pubkey);
 
     // Store auth context
     c.set('auth', auth);
@@ -139,232 +173,67 @@ export function createHttpServer() {
       npub: auth.npub,
       pubkey: auth.pubkey,
       isAdmin: auth.isAdmin,
-      fluxbaseUserId: auth.fluxbaseUserId,
     });
   });
 
-  // ==================== Database Routes ====================
+  // Generate app-agnostic connection token
+  app.post('/connect/token', async (c) => {
 
-  // Query
+    let options: { relay?: string; http?: string; ttl_seconds?: number; scopes?: string[] } = {};
+    try {
+      options = await c.req.json();
+    } catch {
+      // Optional body
+    }
+
+    try {
+      const token = await appsService.generateConnectionToken(options);
+      return c.json({ token });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // ==================== Database Routes (stubbed) ====================
+
   app.get('/db/:table', authMiddleware, async (c) => {
-    const auth = c.get('auth');
-    const table = c.req.param('table');
-    const query = c.req.query();
-
-    const client = FluxbaseClient.forAuth(auth);
-
-    // Parse query params into filter object
-    const filter: Record<string, unknown> = {};
-    const select = query.select;
-    const order = query.order;
-    const limit = query.limit ? parseInt(query.limit) : undefined;
-    const offset = query.offset ? parseInt(query.offset) : undefined;
-
-    // Everything else is a filter
-    for (const [key, value] of Object.entries(query)) {
-      if (!['select', 'order', 'limit', 'offset'].includes(key)) {
-        filter[key] = value;
-      }
-    }
-
-    const result = await client.query({
-      table,
-      select,
-      filter: Object.keys(filter).length > 0 ? filter : undefined,
-      order: order ? { column: order.replace(/\.(asc|desc)$/, ''), ascending: !order.endsWith('.desc') } : undefined,
-      limit,
-      offset,
-    });
-
-    if (result.error) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return c.json(result.data);
+    return c.json({ error: 'Not implemented — direct DB proxy removed' }, 501);
   });
 
-  // Insert
   app.post('/db/:table', authMiddleware, async (c) => {
-    const auth = c.get('auth');
-    const table = c.req.param('table');
-
-    let data: unknown;
-    try {
-      data = await c.req.json();
-    } catch {
-      return c.json({ error: 'Invalid JSON body' }, 400);
-    }
-
-    const client = FluxbaseClient.forAuth(auth);
-    const result = await client.insert({ table, data: data as Record<string, unknown> });
-
-    if (result.error) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return c.json(result.data, 201);
+    return c.json({ error: 'Not implemented — direct DB proxy removed' }, 501);
   });
 
-  // Update
   app.patch('/db/:table', authMiddleware, async (c) => {
-    const auth = c.get('auth');
-    const table = c.req.param('table');
-    const query = c.req.query();
-
-    let data: unknown;
-    try {
-      data = await c.req.json();
-    } catch {
-      return c.json({ error: 'Invalid JSON body' }, 400);
-    }
-
-    // Build filter from query params
-    const filter: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(query)) {
-      filter[key] = value;
-    }
-
-    if (Object.keys(filter).length === 0) {
-      return c.json({ error: 'Filter required for update' }, 400);
-    }
-
-    const client = FluxbaseClient.forAuth(auth);
-    const result = await client.update({ table, filter, data: data as Record<string, unknown> });
-
-    if (result.error) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return c.json(result.data);
+    return c.json({ error: 'Not implemented — direct DB proxy removed' }, 501);
   });
 
-  // Delete
   app.delete('/db/:table', authMiddleware, async (c) => {
-    const auth = c.get('auth');
-    const table = c.req.param('table');
-    const query = c.req.query();
-
-    // Build filter from query params
-    const filter: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(query)) {
-      filter[key] = value;
-    }
-
-    if (Object.keys(filter).length === 0) {
-      return c.json({ error: 'Filter required for delete' }, 400);
-    }
-
-    const client = FluxbaseClient.forAuth(auth);
-    const result = await client.delete({ table, filter });
-
-    if (result.error) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return c.json({ success: true });
+    return c.json({ error: 'Not implemented — direct DB proxy removed' }, 501);
   });
 
-  // ==================== Storage Routes ====================
+  // ==================== Storage Routes (stubbed) ====================
 
-  // Upload
   app.post('/storage/:bucket/*', authMiddleware, async (c) => {
-    const auth = c.get('auth');
-    const bucket = c.req.param('bucket');
-    const path = c.req.path.replace(`/storage/${bucket}/`, '');
-    const contentType = c.req.header('Content-Type') || 'application/octet-stream';
-
-    const body = await c.req.arrayBuffer();
-    const content = new Uint8Array(body);
-
-    const client = FluxbaseClient.forAuth(auth);
-    const result = await client.uploadFile(bucket, path, content, contentType);
-
-    if (result.error) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return c.json(result.data, 201);
+    return c.json({ error: 'Not implemented — storage proxy removed' }, 501);
   });
 
-  // Download
   app.get('/storage/:bucket/*', authMiddleware, async (c) => {
-    const auth = c.get('auth');
-    const bucket = c.req.param('bucket');
-    const path = c.req.path.replace(`/storage/${bucket}/`, '');
-
-    const client = FluxbaseClient.forAuth(auth);
-    const result = await client.downloadFile(bucket, path);
-
-    if (result.error) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return new Response(result.data, {
-      headers: {
-        'Content-Type': result.contentType || 'application/octet-stream',
-      },
-    });
+    return c.json({ error: 'Not implemented — storage proxy removed' }, 501);
   });
 
-  // List
   app.get('/storage/:bucket', authMiddleware, async (c) => {
-    const auth = c.get('auth');
-    const bucket = c.req.param('bucket');
-    const { prefix, limit, offset } = c.req.query();
-
-    const client = FluxbaseClient.forAuth(auth);
-    const result = await client.listFiles(
-      bucket,
-      prefix,
-      limit ? parseInt(limit) : undefined,
-      offset ? parseInt(offset) : undefined
-    );
-
-    if (result.error) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return c.json(result.data);
+    return c.json({ error: 'Not implemented — storage proxy removed' }, 501);
   });
 
-  // Delete file
   app.delete('/storage/:bucket/*', authMiddleware, async (c) => {
-    const auth = c.get('auth');
-    const bucket = c.req.param('bucket');
-    const path = c.req.path.replace(`/storage/${bucket}/`, '');
-
-    const client = FluxbaseClient.forAuth(auth);
-    const result = await client.deleteFile(bucket, path);
-
-    if (result.error) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return c.json({ success: true });
+    return c.json({ error: 'Not implemented — storage proxy removed' }, 501);
   });
 
-  // ==================== Functions Routes ====================
+  // ==================== Functions Routes (stubbed) ====================
 
   app.post('/functions/:name', authMiddleware, async (c) => {
-    const auth = c.get('auth');
-    const name = c.req.param('name');
-
-    let payload: unknown;
-    try {
-      const text = await c.req.text();
-      payload = text ? JSON.parse(text) : undefined;
-    } catch {
-      payload = undefined;
-    }
-
-    const client = FluxbaseClient.forAuth(auth);
-    const result = await client.invokeFunction(name, payload);
-
-    if (result.error) {
-      return c.json({ error: result.error }, 400);
-    }
-
-    return c.json(result.data);
+    return c.json({ error: 'Not implemented — functions proxy removed' }, 501);
   });
 
   // ==================== App Registry Routes ====================
@@ -430,6 +299,67 @@ export function createHttpServer() {
   });
 
   // ==================== Delegation Routes ====================
+
+  // Grant delegation in default namespace (app-less mode)
+  app.post('/delegations', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: CreateDelegationInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!input.delegate_npub || !input.permissions) {
+      return c.json({ error: 'delegate_npub and permissions required' }, 400);
+    }
+
+    try {
+      const result = await delegationsService.grantDelegation(appPubkey, auth, input);
+      return c.json(result, result.created ? 201 : 200);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // List delegations in default namespace (app-less mode)
+  app.get('/delegations', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const delegations = await delegationsService.listDelegations(appPubkey, auth);
+      return c.json({ delegations });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // Revoke delegation in default namespace (app-less mode)
+  app.delete('/delegations/:delegateNpub', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const delegateNpub = c.req.param('delegateNpub');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const revoked = await delegationsService.revokeDelegation(appPubkey, auth, delegateNpub);
+      if (!revoked) return c.json({ error: 'Delegation not found or already revoked' }, 404);
+      return c.json({ success: true });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
 
   // Grant delegation to another pubkey
   app.post('/apps/:appNpub/delegate', authMiddleware, async (c) => {
@@ -533,6 +463,316 @@ export function createHttpServer() {
 
   // ==================== Record Sync Routes (v3) ====================
 
+  // Push config in default namespace (app-less mode)
+  app.get('/push/config', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const config = getConfig();
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+    if (!appPubkey) return c.json({ error: 'Invalid app namespace' }, 400);
+
+    return c.json({
+      enabled: pushService.enabled(),
+      vapid_public_key: config.pushVapidPublicKey || null,
+      collections: ['chat_messages'],
+    });
+  });
+
+  app.post('/push/subscribe', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    if (!pushService.enabled()) return c.json({ error: 'Push notifications are disabled on this server' }, 503);
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: PushSubscriptionUpsertInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!input.subscription?.endpoint || !input.subscription?.keys?.p256dh || !input.subscription?.keys?.auth) {
+      return c.json({ error: 'Invalid PushSubscription payload' }, 400);
+    }
+
+    await pushService.upsertSubscription(
+      appPubkey,
+      auth.pubkey,
+      input.subscription,
+      input.collections || [],
+      input.device_id,
+      c.req.header('User-Agent')
+    );
+
+    return c.json({ success: true });
+  });
+
+  app.post('/push/unsubscribe', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: PushSubscriptionDeleteInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!input.endpoint) return c.json({ error: 'endpoint required' }, 400);
+
+    const removed = await pushService.deleteSubscription(appPubkey, auth.pubkey, input.endpoint);
+    return c.json({ success: true, removed });
+  });
+
+  app.get('/push/subscriptions', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    const subscriptions = await pushService.listSubscriptions(appPubkey, auth.pubkey);
+    return c.json({ subscriptions });
+  });
+
+  // Sync records (default namespace, app-less mode)
+  app.post('/records/sync', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let records: SyncRecordInputV3[];
+    try {
+      const body = await c.req.json();
+      records = body.records;
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+    if (!Array.isArray(records)) return c.json({ error: 'records array required' }, 400);
+
+    try {
+      const result = await recordsService.syncRecords(appPubkey, auth, records);
+      if (result.outcomes?.length > 0) await pushService.notifyOnSyncOutcomes(appPubkey, auth.pubkey, result.outcomes);
+      return c.json({ synced: result.synced, created: result.created, updated: result.updated, rejected: result.rejected });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/records/fetch', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const { collection, since } = c.req.query();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const result = await recordsService.fetchRecords(appPubkey, auth, collection, since);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/records/delegated', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const { collection, owner, limit: limitStr, cursor } = c.req.query();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const limit = limitStr ? Math.min(parseInt(limitStr, 10), 100) : undefined;
+      const result = await recordsService.fetchDelegatedRecords(appPubkey, auth.pubkey, collection, owner, limit, cursor);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/records/history/:recordId', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const recordId = c.req.param('recordId');
+    const { include_data } = c.req.query();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const result = await recordsService.getRecordHistory(appPubkey, recordId, include_data === 'true');
+      if (!result) return c.json({ error: 'Record not found' }, 404);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.delete('/records', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const { record_id } = c.req.query();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+    if (!record_id) return c.json({ error: 'record_id query parameter required' }, 400);
+
+    try {
+      const result = await recordsService.deleteRecord(appPubkey, auth, record_id);
+      if (!result) return c.json({ error: 'Record not found or already deleted' }, 404);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  // Register or update Web Push subscription
+  app.get('/apps/:appNpub/push/config', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const config = getConfig();
+
+    // Check user access
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    // Ensure app namespace is valid even if unused in this handler
+    if (!appPubkey) {
+      return c.json({ error: 'Invalid app namespace' }, 400);
+    }
+
+    return c.json({
+      enabled: pushService.enabled(),
+      vapid_public_key: config.pushVapidPublicKey || null,
+      collections: ['chat_messages'],
+    });
+  });
+
+  // Register or update Web Push subscription
+  app.post('/apps/:appNpub/push/subscribe', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+
+    if (!pushService.enabled()) {
+      return c.json({ error: 'Push notifications are disabled on this server' }, 503);
+    }
+
+    // Check user access
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    let input: PushSubscriptionUpsertInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!input.subscription?.endpoint || !input.subscription?.keys?.p256dh || !input.subscription?.keys?.auth) {
+      return c.json({ error: 'Invalid PushSubscription payload' }, 400);
+    }
+
+    await pushService.upsertSubscription(
+      appPubkey,
+      auth.pubkey,
+      input.subscription,
+      input.collections || [],
+      input.device_id,
+      c.req.header('User-Agent')
+    );
+
+    return c.json({ success: true });
+  });
+
+  // Remove Web Push subscription
+  app.post('/apps/:appNpub/push/unsubscribe', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+
+    // Check user access
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    let input: PushSubscriptionDeleteInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!input.endpoint) {
+      return c.json({ error: 'endpoint required' }, 400);
+    }
+
+    const removed = await pushService.deleteSubscription(appPubkey, auth.pubkey, input.endpoint);
+    return c.json({ success: true, removed });
+  });
+
+  // List Web Push subscriptions for current user/app
+  app.get('/apps/:appNpub/push/subscriptions', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+
+    // Check user access
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    const subscriptions = await pushService.listSubscriptions(appPubkey, auth.pubkey);
+    return c.json({ subscriptions });
+  });
+
   // Sync records
   app.post('/records/:appNpub/sync', authMiddleware, async (c) => {
     const auth = c.get('auth');
@@ -567,7 +807,15 @@ export function createHttpServer() {
 
     try {
       const result = await recordsService.syncRecords(appPubkey, auth, records);
-      return c.json(result);
+      if (result.outcomes?.length > 0) {
+        await pushService.notifyOnSyncOutcomes(appPubkey, auth.pubkey, result.outcomes);
+      }
+      return c.json({
+        synced: result.synced,
+        created: result.created,
+        updated: result.updated,
+        rejected: result.rejected,
+      });
     } catch (err) {
       return c.json({ error: String(err) }, 500);
     }

@@ -1,210 +1,154 @@
-# Flux Adaptor
+# SuperBased Service
 
-**Nostr-native gateway to Fluxbase** - Access your backend via HTTP or Nostr relays using cryptographic identity.
+Nostr-authenticated encrypted records service with dual transports:
+- HTTP (`src/transports/http.ts`)
+- MCP over Nostr/CVM (`src/transports/cvm.ts`)
 
-## Overview
+## Architecture (v3)
 
-Flux Adaptor provides two access paths to a Fluxbase backend:
+The records layer is now direct Postgres with append-only versioned rows.
 
-1. **Direct HTTP** - Fast path when you have network access
-2. **Nostr/CVM** - Private path via Nostr relays (works behind NAT, no domain needed)
+- Storage table: `superbased_records_v3`
+- Record states: `live` -> `superseded` -> `deleted` (terminal)
+- Writes are atomic CTE transitions (supersede + insert in one query)
+- Delegated reads use GIN-indexed `delegate_payloads` JSONB lookups
+- `encrypted_from` is preserved across versions for decryption key derivation
 
-Both paths use **NIP-98** authentication - users sign requests with their Nostr keys. No passwords, no API keys in apps.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     APP CLIENTS                             │
-│                                                             │
-│    ┌──────────────────┐         ┌──────────────────┐       │
-│    │   Fast Path      │         │   Private Path   │       │
-│    │   (HTTPS)        │         │   (Nostr/CVM)    │       │
-│    └────────┬─────────┘         └────────┬─────────┘       │
-└─────────────┼───────────────────────────┼───────────────────┘
-              │                            │
-              ▼                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│              FLUX ADAPTOR                                   │
-│                                                             │
-│    ┌──────────────────────────────────────────────┐        │
-│    │            NIP-98 Verification               │        │
-│    │       (Cryptographic auth via Nostr)         │        │
-│    └──────────────────────┬───────────────────────┘        │
-│                           ▼                                 │
-│    ┌──────────────────────────────────────────────┐        │
-│    │       npub → Fluxbase User Mapping           │        │
-│    │      (Auto-create users on first request)    │        │
-│    └──────────────────────┬───────────────────────┘        │
-│                           ▼                                 │
-│    ┌──────────────────────────────────────────────┐        │
-│    │           Fluxbase API Client                │        │
-│    └──────────────────────┬───────────────────────┘        │
-└───────────────────────────┼─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                       FLUXBASE                              │
-│           (Database, Storage, Functions, Realtime)          │
-└─────────────────────────────────────────────────────────────┘
-```
+Reference docs:
+- `CLAUDE.md` (service architecture + patterns)
+- `../sb_encrypted_records_spec.md` (record protocol/spec)
 
 ## Quick Start
 
-### 1. Install Dependencies
-
 ```bash
-cd flux_adaptor
 bun install
+cp .env.example .env
+bun run init
+bun run dev
 ```
 
-### 2. Configure
+Useful scripts:
+
+```bash
+bun run dev        # Hot reload
+bun run start      # Production start
+bun run init       # Create/upgrade DB tables + indexes
+bun run prune      # Prune superseded versions
+bun run typecheck  # TypeScript check
+bun run test       # Integration tests (requires Postgres)
+```
+
+## Docker
 
 ```bash
 cp .env.example .env
-# Edit .env with your Fluxbase URL and keys
+docker compose up -d --build
+curl http://localhost:3080/health
 ```
 
-### 3. Run
-
-```bash
-bun run dev   # Development with hot reload
-bun start     # Production
-```
+Notes:
+- If `POSTGRES_URL` is unset, compose uses bundled Postgres: `postgres://postgres:postgres@postgres:5432/fluxbase`
+- Data persists in `postgres_data` volume
+- Schema init runs via `src/cli/init-db.ts`
 
 ## Configuration
 
 | Variable | Description | Default |
-|----------|-------------|---------|
-| `FLUXBASE_URL` | Fluxbase server URL | `http://localhost:8090` |
-| `FLUXBASE_SERVICE_KEY` | Service role key for admin operations | - |
-| `HTTP_PORT` | HTTP server port | `3080` |
-| `NOSTR_RELAYS` | Comma-separated relay URLs | `wss://relay.damus.io` |
-| `SERVER_PRIVATE_KEY` | Server identity (hex, auto-generated if empty) | - |
+|---|---|---|
+| `HTTP_PORT` | HTTP port | `3080` |
+| `HTTP_HOST` | HTTP host bind | `0.0.0.0` |
+| `NOSTR_RELAYS` | Comma-separated relay URLs | `wss://relay.damus.io,wss://nos.lol` |
+| `SERVER_PRIVATE_KEY` | Server private key hex (auto-generated if empty) | - |
 | `ADMIN_NPUBS` | Comma-separated admin npubs | - |
+| `NIP98_MAX_AGE_SECONDS` | Max accepted NIP-98 auth event age | `60` |
+| `SERVICE_TOKEN` | Optional Bearer token for service-level access | - |
+| `POSTGRES_URL` | Postgres connection URL | `postgres://postgres:postgres@localhost:5432/fluxbase` |
+| `LOG_LEVEL` | Log level | `info` |
+| `PUSH_ENABLED` | Enable Web Push features | `false` |
+| `PUSH_VAPID_PUBLIC_KEY` | Web Push VAPID public key | - |
+| `PUSH_VAPID_PRIVATE_KEY` | Web Push VAPID private key | - |
+| `PUSH_VAPID_SUBJECT` | Web Push subject | - |
+
+## Authentication
+
+Protected endpoints/tools use NIP-98 auth:
+
+```txt
+Authorization: Nostr <base64-encoded-kind-27235-event>
+```
+
+Supported alternative for service integrations:
+
+```txt
+Authorization: Bearer <SERVICE_TOKEN>
+```
 
 ## HTTP API
 
-All endpoints (except `/health`) require NIP-98 authentication.
+Public endpoints:
+- `GET /health`
+- `GET /ui`
+- `POST /connect/token`
 
-### Authentication
+Core endpoints:
+- Auth: `GET /auth/me`
+- Apps: `POST /apps/register`, `GET /apps`, `GET /apps/:appNpub`, `POST /apps/:appNpub/token`
+- Delegations: `POST /delegations`, `GET /delegations`, `DELETE /delegations/:delegateNpub`
+- App delegations: `POST /apps/:appNpub/delegate`, `GET /apps/:appNpub/delegations`, `DELETE /apps/:appNpub/delegate/:delegateNpub`
+- Push (default namespace + app namespace): `/push/*`, `/apps/:appNpub/push/*`
+- Records (default namespace): `POST /records/sync`, `GET /records/fetch`, `GET /records/delegated`, `GET /records/history/:recordId`, `DELETE /records?record_id=...`
+- Records (per-app namespace): `POST /records/:appNpub/sync`, `GET /records/:appNpub/fetch`, `GET /records/:appNpub/delegated`, `GET /records/:appNpub/history/:recordId`, `DELETE /records/:appNpub?record_id=...`
 
-Include a signed NIP-98 event in the Authorization header:
+Deprecated/stubbed endpoints (intentional `501`):
+- `/db/:table`
+- `/storage/:bucket/*`
+- `/functions/:name`
 
-```
-Authorization: Nostr <base64-encoded-event>
-```
+## MCP Tools (CVM)
 
-The event (kind 27235) must include:
-- `u` tag: Request URL
-- `method` tag: HTTP method
-- `payload` tag: SHA256 hash of body (for POST/PUT/PATCH)
+Implemented:
+- `health`
+- `auth_whoami`
+- `register_app`
+- `list_apps`
+- `get_app`
+- `generate_token`
+- `generate_connection_token`
+- `sync_records`
+- `fetch_records`
+- `fetch_delegated_records`
+- `delete_record`
+- `get_record_history`
 
-### Endpoints
+Stubbed (not implemented):
+- `db_query`, `db_insert`, `db_update`, `db_delete`
+- `storage_upload`, `storage_download`, `storage_list`, `storage_delete`
+- `function_invoke`
 
-#### Auth
-```
-GET /auth/me              # Current user info
-```
+## Testing
 
-#### Database
-```
-GET    /db/:table         # Query records
-POST   /db/:table         # Insert records
-PATCH  /db/:table         # Update records (filter in query string)
-DELETE /db/:table         # Delete records (filter in query string)
-```
+Integration tests run against real Postgres.
 
-#### Storage
-```
-POST   /storage/:bucket/* # Upload file
-GET    /storage/:bucket/* # Download file
-GET    /storage/:bucket   # List files
-DELETE /storage/:bucket/* # Delete file
-```
+Default DB:
+- `postgres://postgres:postgres@localhost:5432/fluxbase`
 
-#### Functions
-```
-POST   /functions/:name   # Invoke edge function
-```
+Override with:
+- `POSTGRES_URL`
 
-## MCP Tools (via Nostr/CVM)
-
-When connecting via Nostr relays, these MCP tools are available:
-
-| Tool | Description |
-|------|-------------|
-| `health` | Check service health |
-| `auth_whoami` | Get current user info |
-| `db_query` | Query database records |
-| `db_insert` | Insert database records |
-| `db_update` | Update database records |
-| `db_delete` | Delete database records |
-| `storage_upload` | Upload file (base64 content) |
-| `storage_download` | Download file |
-| `storage_list` | List files in bucket |
-| `storage_delete` | Delete file |
-| `function_invoke` | Invoke edge function |
-
-## Use Cases
-
-### 1. Standard Web App
-Direct HTTPS for best performance:
-```typescript
-const response = await fetch('https://api.example.com/db/posts', {
-  headers: {
-    'Authorization': `Nostr ${base64Event}`,
-  },
-});
-```
-
-### 2. Privacy-Focused App
-Route through Nostr relays:
-```typescript
-// Connect to Flux Adaptor via CVM
-const client = new CvmClient({
-  serverNpub: 'npub1...',
-  relays: ['wss://relay.damus.io'],
-});
-
-const posts = await client.call('db_query', {
-  table: 'posts',
-  filter: { published: true },
-});
-```
-
-### 3. Home Server (No Domain)
-Run Fluxbase + Flux Adaptor at home, access via Nostr:
-- No domain name needed
-- No port forwarding required
-- Works behind any NAT
-
-### 4. Cloud + Local Backup
-- Cloud instance for production
-- Home instance synced as backup
-- Same npub works on both
-
-## Security
-
-- **NIP-98**: Cryptographic request signing (no passwords)
-- **User Mapping**: npub → Fluxbase user (auto-created)
-- **Short-lived JWTs**: Generated per-request
-- **Admin Control**: Configurable admin npubs
-
-## Development
+Run:
 
 ```bash
-bun run dev          # Start with hot reload
-bun run typecheck    # Type check
+bun test src/__tests__/
+bun test src/__tests__/records-service.test.ts
+bun test src/__tests__/prune-records.test.ts
 ```
 
-## Roadmap
-
-- [ ] Full CVM protocol implementation with @contextvm/sdk
-- [ ] Realtime subscriptions bridge
-- [ ] Rate limiting per npub
-- [ ] Usage tracking / billing hooks
-- [ ] Multi-workspace support
+Coverage focus:
+- append-only sync/versioning
+- deletion terminal behavior
+- delegated privacy constraints
+- history behavior
+- prune threshold and idempotency
 - [ ] Home ↔ Cloud sync
 
 ## License

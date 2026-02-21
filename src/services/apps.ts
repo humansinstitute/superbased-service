@@ -1,28 +1,17 @@
-import { FluxbaseClient } from '../fluxbase/client';
-import { getConfig } from '../config';
+import { getDb } from '../db/postgres';
 import { nip19, verifyEvent, finalizeEvent } from 'nostr-tools';
 import { sha256 } from '@noble/hashes/sha256';
 import { bytesToHex } from '@noble/hashes/utils';
-import type { AuthContext, AppInfo, RegisterResult, TokenGenerationOptions } from '../types';
+import { getConfig } from '../config';
+import type { AppInfo, RegisterResult, TokenGenerationOptions, ConnectionTokenOptions } from '../types';
 
 /**
  * Service for managing app registration and tokens
  */
 export class AppsService {
-  /**
-   * Register a new app
-   * - Verifies attestation is signed by app owner
-   * - Verifies attestation points to this server
-   * - Creates app record and schema
-   */
-  async registerApp(
-    auth: AuthContext,
-    name: string,
-    attestationBase64: string
-  ): Promise<RegisterResult> {
+  async registerApp(auth: { pubkey: string }, name: string, attestationBase64: string): Promise<RegisterResult> {
     const config = getConfig();
 
-    // Decode and verify attestation
     let attestation: any;
     try {
       attestation = JSON.parse(atob(attestationBase64));
@@ -38,65 +27,44 @@ export class AppsService {
       throw new Error(`Invalid attestation kind: expected 30079, got ${attestation.kind}`);
     }
 
-    // Verify attestation points to this server
     const serverNpub = nip19.npubEncode(config.serverPublicKey);
     const attestedServer = attestation.tags.find((t: string[]) => t[0] === 'server')?.[1];
     if (attestedServer !== serverNpub) {
       throw new Error(`Attestation is for a different server. Expected ${serverNpub}, got ${attestedServer}`);
     }
 
-    // App pubkey is the attestation signer
     const appPubkeyHex = attestation.pubkey;
     const appNpub = nip19.npubEncode(appPubkeyHex);
 
-    // The authenticated user must be the app (signing with app nsec)
     if (auth.pubkey !== appPubkeyHex) {
       throw new Error('Must authenticate as app owner to register');
     }
 
-    // Generate schema name from app pubkey
     const schemaHash = bytesToHex(sha256(appPubkeyHex)).slice(0, 16);
     const schemaName = `app_${schemaHash}`;
 
-    // Check if already registered
     const existing = await this.getApp(appPubkeyHex);
     if (existing) {
       return { app_npub: appNpub, schema_name: existing.schema_name, created: false };
     }
 
-    // Use service key for admin operations
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
+    const inserted = await sql`
+      INSERT INTO superbased_apps
+        (app_pubkey, owner_pubkey, name, schema_name, attestation_event)
+      VALUES
+        (${appPubkeyHex}, ${appPubkeyHex}, ${name}, ${schemaName}, ${JSON.stringify(attestation)})
+      RETURNING *
+    `;
 
-    // Create app record
-    const result = await client.insert({
-      table: 'superbased_apps',
-      data: {
-        app_pubkey: appPubkeyHex,
-        owner_pubkey: appPubkeyHex,
-        name,
-        schema_name: schemaName,
-        attestation_event: JSON.stringify(attestation),
-      },
-    });
-
-    if (result.error) {
-      throw new Error(`Failed to register app: ${result.error}`);
+    if (inserted.length === 0) {
+      throw new Error('Failed to register app');
     }
-
-    // No per-app schema needed - we use a shared superbased_records table
-    // with app_pubkey column to isolate data
 
     return { app_npub: appNpub, schema_name: schemaName, created: true };
   }
 
-  /**
-   * Generate token for app (only owner can generate)
-   */
-  async generateToken(
-    auth: AuthContext,
-    appNpub: string,
-    options: TokenGenerationOptions = {}
-  ): Promise<string> {
+  async generateToken(auth: { pubkey: string }, appNpub: string, options: TokenGenerationOptions = {}): Promise<string> {
     const config = getConfig();
     const appInfo = await this.getAppByNpub(appNpub);
 
@@ -104,14 +72,12 @@ export class AppsService {
       throw new Error('App not found');
     }
 
-    // Must be app owner
     if (auth.pubkey !== appInfo.app_pubkey) {
       throw new Error('Only app owner can generate tokens');
     }
 
     const serverNpub = nip19.npubEncode(config.serverPublicKey);
 
-    // Build token tags
     const tags: string[][] = [
       ['d', 'superbased-token'],
       ['app', appNpub],
@@ -124,7 +90,6 @@ export class AppsService {
       tags.push(['http', options.http]);
     }
 
-    // Server signs the token
     const tokenEvent = finalizeEvent({
       kind: 30078,
       created_at: Math.floor(Date.now() / 1000),
@@ -136,28 +101,46 @@ export class AppsService {
   }
 
   /**
-   * Get app by pubkey (hex)
+   * Generate app-agnostic connection token.
+   * Token format: base64(json payload). No signature, no auth semantics.
    */
-  async getApp(appPubkeyHex: string): Promise<AppInfo | null> {
+  generateConnectionToken(options: ConnectionTokenOptions = {}): string {
     const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const serverNpub = nip19.npubEncode(config.serverPublicKey);
+    const now = Math.floor(Date.now() / 1000);
+    const ttlSeconds = Math.max(60, Math.min(options.ttl_seconds ?? 60 * 60 * 24 * 30, 60 * 60 * 24 * 365));
 
-    const result = await client.query({
-      table: 'superbased_apps',
-      filter: { app_pubkey: appPubkeyHex },
-      limit: 1,
-    });
+    const payload = {
+      type: 'superbased_connection',
+      version: 1,
+      issued_at: now,
+      expires_at: now + ttlSeconds,
+      server_npub: serverNpub,
+      http: options.http || `http://${config.httpHost}:${config.httpPort}`,
+      relay: options.relay || config.nostrRelays[0] || null,
+      scopes: options.scopes && options.scopes.length > 0 ? options.scopes : [],
+      note: 'Connection metadata only. API requests still require NIP-98 per request.',
+    };
 
-    if (result.error || !result.data?.length) {
+    return btoa(JSON.stringify(payload));
+  }
+
+  async getApp(appPubkeyHex: string): Promise<AppInfo | null> {
+    const sql = getDb();
+
+    const rows = await sql`
+      SELECT * FROM superbased_apps
+      WHERE app_pubkey = ${appPubkeyHex}
+      LIMIT 1
+    `;
+
+    if (rows.length === 0) {
       return null;
     }
 
-    return result.data[0] as AppInfo;
+    return rows[0] as unknown as AppInfo;
   }
 
-  /**
-   * Get app by npub
-   */
   async getAppByNpub(appNpub: string): Promise<AppInfo | null> {
     let decoded;
     try {
@@ -169,21 +152,16 @@ export class AppsService {
     return this.getApp(decoded.data as string);
   }
 
-  /**
-   * List apps owned by pubkey
-   */
   async listApps(ownerPubkeyHex: string): Promise<AppInfo[]> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
-    const result = await client.query({
-      table: 'superbased_apps',
-      filter: { owner_pubkey: ownerPubkeyHex },
-    });
+    const rows = await sql`
+      SELECT * FROM superbased_apps
+      WHERE owner_pubkey = ${ownerPubkeyHex}
+    `;
 
-    return (result.data || []) as AppInfo[];
+    return rows as unknown as AppInfo[];
   }
 }
 
-// Singleton instance
 export const appsService = new AppsService();

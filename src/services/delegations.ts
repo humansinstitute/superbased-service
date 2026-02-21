@@ -1,6 +1,5 @@
 import { nip19 } from 'nostr-tools';
-import { FluxbaseClient } from '../fluxbase/client';
-import { getConfig } from '../config';
+import { getDb } from '../db/postgres';
 import type {
   AuthContext,
   AppDelegation,
@@ -24,8 +23,7 @@ export class DelegationsService {
     auth: AuthContext,
     input: CreateDelegationInput
   ): Promise<DelegationResult> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
     // Decode delegate npub to hex
     let delegatePubkey: string;
@@ -48,35 +46,24 @@ export class DelegationsService {
     }
 
     // Check if delegation already exists
-    const existing = await client.query({
-      table: DELEGATIONS_TABLE,
-      filter: {
-        app_pubkey: appPubkey,
-        owner_pubkey: auth.pubkey,
-        delegate_pubkey: delegatePubkey,
-      },
-      limit: 1,
-    });
+    const existing = await sql`
+      SELECT * FROM ${sql(DELEGATIONS_TABLE)}
+      WHERE app_pubkey = ${appPubkey}
+        AND owner_pubkey = ${auth.pubkey}
+        AND delegate_pubkey = ${delegatePubkey}
+      LIMIT 1
+    `;
 
-    if (existing.data?.length) {
-      const existingDelegation = existing.data[0] as AppDelegation;
+    if (existing.length > 0) {
+      const existingDelegation = existing[0] as unknown as AppDelegation;
 
-      // If revoked, un-revoke and update permissions
-      // Otherwise just update permissions
-      const updateResult = await client.update({
-        table: DELEGATIONS_TABLE,
-        filter: {
-          id: existingDelegation.id,
-        },
-        data: {
-          permissions: input.permissions,
-          revoked_at: null,
-        },
-      });
-
-      if (updateResult.error) {
-        throw new Error(`Failed to update delegation: ${updateResult.error}`);
-      }
+      // Update permissions (and un-revoke if revoked)
+      await sql`
+        UPDATE ${sql(DELEGATIONS_TABLE)}
+        SET permissions = ${sql.array(input.permissions)},
+            revoked_at = NULL
+        WHERE id = ${existingDelegation.id}
+      `;
 
       return {
         delegation: {
@@ -89,26 +76,16 @@ export class DelegationsService {
     }
 
     // Create new delegation
-    const insertResult = await client.insert({
-      table: DELEGATIONS_TABLE,
-      data: {
-        app_pubkey: appPubkey,
-        owner_pubkey: auth.pubkey,
-        delegate_pubkey: delegatePubkey,
-        permissions: input.permissions,
-      },
-    });
-
-    if (insertResult.error) {
-      throw new Error(`Failed to create delegation: ${insertResult.error}`);
-    }
-
-    const newDelegation = Array.isArray(insertResult.data)
-      ? insertResult.data[0]
-      : insertResult.data;
+    const inserted = await sql`
+      INSERT INTO ${sql(DELEGATIONS_TABLE)}
+        (app_pubkey, owner_pubkey, delegate_pubkey, permissions)
+      VALUES
+        (${appPubkey}, ${auth.pubkey}, ${delegatePubkey}, ${sql.array(input.permissions)})
+      RETURNING *
+    `;
 
     return {
-      delegation: newDelegation as AppDelegation,
+      delegation: inserted[0] as unknown as AppDelegation,
       created: true,
     };
   }
@@ -120,25 +97,17 @@ export class DelegationsService {
     appPubkey: string,
     auth: AuthContext
   ): Promise<AppDelegation[]> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
-    const result = await client.query({
-      table: DELEGATIONS_TABLE,
-      filter: {
-        app_pubkey: appPubkey,
-        owner_pubkey: auth.pubkey,
-      },
-      order: { column: 'created_at', ascending: false },
-    });
+    const rows = await sql`
+      SELECT * FROM ${sql(DELEGATIONS_TABLE)}
+      WHERE app_pubkey = ${appPubkey}
+        AND owner_pubkey = ${auth.pubkey}
+        AND revoked_at IS NULL
+      ORDER BY created_at DESC
+    `;
 
-    if (result.error) {
-      throw new Error(`Failed to list delegations: ${result.error}`);
-    }
-
-    // Filter out revoked delegations
-    const delegations = (result.data || []) as AppDelegation[];
-    return delegations.filter(d => !d.revoked_at);
+    return rows as unknown as AppDelegation[];
   }
 
   /**
@@ -149,8 +118,7 @@ export class DelegationsService {
     auth: AuthContext,
     delegateNpub: string
   ): Promise<boolean> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
     // Decode delegate npub to hex
     let delegatePubkey: string;
@@ -164,19 +132,16 @@ export class DelegationsService {
       throw new Error(`Invalid delegate_npub: ${err}`);
     }
 
-    const result = await client.update({
-      table: DELEGATIONS_TABLE,
-      filter: {
-        app_pubkey: appPubkey,
-        owner_pubkey: auth.pubkey,
-        delegate_pubkey: delegatePubkey,
-      },
-      data: {
-        revoked_at: new Date().toISOString(),
-      },
-    });
+    const result = await sql`
+      UPDATE ${sql(DELEGATIONS_TABLE)}
+      SET revoked_at = now()
+      WHERE app_pubkey = ${appPubkey}
+        AND owner_pubkey = ${auth.pubkey}
+        AND delegate_pubkey = ${delegatePubkey}
+        AND revoked_at IS NULL
+    `;
 
-    return !result.error;
+    return result.count > 0;
   }
 
   /**
@@ -187,31 +152,22 @@ export class DelegationsService {
     ownerPubkey: string,
     delegatePubkey: string
   ): Promise<AppDelegation | null> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
-    const result = await client.query({
-      table: DELEGATIONS_TABLE,
-      filter: {
-        app_pubkey: appPubkey,
-        owner_pubkey: ownerPubkey,
-        delegate_pubkey: delegatePubkey,
-      },
-      limit: 1,
-    });
+    const rows = await sql`
+      SELECT * FROM ${sql(DELEGATIONS_TABLE)}
+      WHERE app_pubkey = ${appPubkey}
+        AND owner_pubkey = ${ownerPubkey}
+        AND delegate_pubkey = ${delegatePubkey}
+        AND revoked_at IS NULL
+      LIMIT 1
+    `;
 
-    if (result.error || !result.data?.length) {
+    if (rows.length === 0) {
       return null;
     }
 
-    const delegation = result.data[0] as AppDelegation;
-
-    // Return null if revoked
-    if (delegation.revoked_at) {
-      return null;
-    }
-
-    return delegation;
+    return rows[0] as unknown as AppDelegation;
   }
 
   /**
@@ -221,25 +177,17 @@ export class DelegationsService {
     appPubkey: string,
     delegatePubkey: string
   ): Promise<AppDelegation[]> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
-    const result = await client.query({
-      table: DELEGATIONS_TABLE,
-      filter: {
-        app_pubkey: appPubkey,
-        delegate_pubkey: delegatePubkey,
-      },
-      order: { column: 'created_at', ascending: false },
-    });
+    const rows = await sql`
+      SELECT * FROM ${sql(DELEGATIONS_TABLE)}
+      WHERE app_pubkey = ${appPubkey}
+        AND delegate_pubkey = ${delegatePubkey}
+        AND revoked_at IS NULL
+      ORDER BY created_at DESC
+    `;
 
-    if (result.error) {
-      return [];
-    }
-
-    // Filter out revoked delegations
-    const delegations = (result.data || []) as AppDelegation[];
-    return delegations.filter(d => !d.revoked_at);
+    return rows as unknown as AppDelegation[];
   }
 
   /**

@@ -10,6 +10,7 @@ import type {
   DelegatedFetchResultV3,
   HistoryResultV3,
   HistoryVersionV3,
+  SyncOutcomeRecord,
 } from '../types';
 
 const TABLE = 'superbased_records_v3';
@@ -25,12 +26,13 @@ export class RecordsService {
     appPubkey: string,
     auth: AuthContext,
     records: SyncRecordInputV3[]
-  ): Promise<SyncResultV3> {
+  ): Promise<SyncResultV3 & { outcomes: SyncOutcomeRecord[] }> {
     const sql = getDb();
     const synced: { record_id: string; version: number }[] = [];
     const rejected: { record_id: string; reason: string }[] = [];
     let created = 0;
     let updated = 0;
+    const outcomes: SyncOutcomeRecord[] = [];
 
     for (const record of records) {
       // Find existing live or deleted row
@@ -96,7 +98,14 @@ export class RecordsService {
         `;
 
         if (result.length > 0) {
-          synced.push({ record_id: record.record_id, version: result[0].version });
+          const syncedVersion = result[0].version;
+          synced.push({ record_id: record.record_id, version: syncedVersion });
+          outcomes.push({
+            record_id: record.record_id,
+            version: syncedVersion,
+            owner_pubkey: recordOwner,
+            collection: record.collection || 'default',
+          });
           updated++;
         }
       } else {
@@ -134,12 +143,19 @@ export class RecordsService {
           RETURNING version
         `;
 
-        synced.push({ record_id: record.record_id, version: result[0].version });
+        const syncedVersion = result[0].version;
+        synced.push({ record_id: record.record_id, version: syncedVersion });
+        outcomes.push({
+          record_id: record.record_id,
+          version: syncedVersion,
+          owner_pubkey: recordOwner,
+          collection: record.collection || 'default',
+        });
         created++;
       }
     }
 
-    return { synced, created, updated, rejected };
+    return { synced, created, updated, rejected, outcomes };
   }
 
   /**

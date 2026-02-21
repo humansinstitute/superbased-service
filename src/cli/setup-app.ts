@@ -71,7 +71,7 @@ async function main() {
     print(`  ✓ Server npub: ${serverNpub}`);
   } catch (err) {
     print(`  ✗ Failed to connect: ${err}`);
-    print('\nMake sure the flux adaptor server is running.');
+    print('\nMake sure the superbased service server is running.');
     rl.close();
     process.exit(1);
   }

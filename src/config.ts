@@ -2,11 +2,6 @@ import { generateSecretKey, getPublicKey } from 'nostr-tools';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils';
 
 export interface Config {
-  // Fluxbase
-  fluxbaseUrl: string;
-  fluxbaseAnonKey: string;
-  fluxbaseServiceKey: string;
-
   // HTTP Server
   httpPort: number;
   httpHost: string;
@@ -21,19 +16,17 @@ export interface Config {
   nip98MaxAgeSeconds: number;
   serviceToken: string | null;
 
-  // Postgres (direct connection for records v3)
+  // Postgres
   postgresUrl: string;
 
   // Logging
   logLevel: 'debug' | 'info' | 'warn' | 'error';
-}
 
-function getEnv(key: string, defaultValue?: string): string {
-  const value = process.env[key] ?? defaultValue;
-  if (value === undefined) {
-    throw new Error(`Missing required environment variable: ${key}`);
-  }
-  return value;
+  // Web Push
+  pushEnabled: boolean;
+  pushVapidPublicKey: string | null;
+  pushVapidPrivateKey: string | null;
+  pushVapidSubject: string | null;
 }
 
 function getEnvOptional(key: string, defaultValue: string): string {
@@ -65,11 +58,6 @@ export function loadConfig(): Config {
   const adminNpubs = adminStr.split(',').map(n => n.trim()).filter(Boolean);
 
   return {
-    // Fluxbase
-    fluxbaseUrl: getEnv('FLUXBASE_URL', 'http://localhost:8090'),
-    fluxbaseAnonKey: getEnvOptional('FLUXBASE_ANON_KEY', ''),
-    fluxbaseServiceKey: getEnvOptional('FLUXBASE_SERVICE_KEY', ''),
-
     // HTTP Server
     httpPort: parseInt(getEnvOptional('HTTP_PORT', '3080'), 10),
     httpHost: getEnvOptional('HTTP_HOST', '0.0.0.0'),
@@ -89,6 +77,12 @@ export function loadConfig(): Config {
 
     // Logging
     logLevel: getEnvOptional('LOG_LEVEL', 'info') as Config['logLevel'],
+
+    // Web Push
+    pushEnabled: getEnvOptional('PUSH_ENABLED', 'false') === 'true',
+    pushVapidPublicKey: process.env.PUSH_VAPID_PUBLIC_KEY || null,
+    pushVapidPrivateKey: process.env.PUSH_VAPID_PRIVATE_KEY || null,
+    pushVapidSubject: process.env.PUSH_VAPID_SUBJECT || null,
   };
 }
 

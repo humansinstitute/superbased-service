@@ -61,6 +61,24 @@ Use this when you have direct network access to SuperBased. Lowest latency optio
 
 ### Endpoints
 
+### Connection Bootstrap
+
+You can use the built-in web UI for setup:
+
+```
+GET https://superbased.otherstuff.ai/ui
+```
+
+The UI can generate and decode connection keys, and request a connection key from:
+
+```
+POST https://superbased.otherstuff.ai/connect/token
+```
+
+Notes:
+- `/connect/token` returns unsigned base64 JSON metadata (not a credential).
+- API requests still require NIP-98 signatures per request.
+
 #### Health Check (No Auth)
 ```
 GET https://superbased.otherstuff.ai/health

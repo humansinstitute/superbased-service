@@ -1,12 +1,12 @@
 /**
- * Flux Adaptor - Nostr-native gateway to Fluxbase
+ * SuperBased Service - Nostr-native encrypted records gateway
  *
  * Provides two access methods:
  * 1. Direct HTTP - Fast path with NIP-98 authentication
  * 2. Nostr/CVM - Private path via Nostr relays (no domain needed)
  *
- * Both methods authenticate users via their Nostr keys (NIP-98)
- * and map them to Fluxbase users automatically.
+ * Both methods authenticate users via their Nostr keys (NIP-98).
+ * Data is stored directly in Postgres.
  */
 
 import { getConfig } from './config';
@@ -17,8 +17,8 @@ import { nip19 } from 'nostr-tools';
 async function main() {
   console.log('');
   console.log('╔═══════════════════════════════════════════════════════════╗');
-  console.log('║               FLUX ADAPTOR v0.1.0                         ║');
-  console.log('║         Nostr-native gateway to Fluxbase                  ║');
+  console.log('║               SUPERBASED SERVICE v0.1.0                         ║');
+  console.log('║       Nostr-native encrypted records gateway               ║');
   console.log('╚═══════════════════════════════════════════════════════════╝');
   console.log('');
 
@@ -32,10 +32,9 @@ async function main() {
   console.log(`  hex:  ${config.serverPublicKey}`);
   console.log('');
 
-  // Display Fluxbase connection
-  console.log('Fluxbase:');
-  console.log(`  URL: ${config.fluxbaseUrl}`);
-  console.log(`  Service Key: ${config.fluxbaseServiceKey ? '****' + config.fluxbaseServiceKey.slice(-4) : 'not configured'}`);
+  // Display Postgres connection
+  console.log('Postgres:');
+  console.log(`  URL: ${config.postgresUrl.replace(/:[^@]*@/, ':****@')}`);
   console.log('');
 
   // Start HTTP server
@@ -56,10 +55,11 @@ async function main() {
   // Display endpoints
   console.log('═══════════════════════════════════════════════════════════');
   console.log('');
-  console.log('HTTP Endpoints (NIP-98 auth required):');
+  console.log('HTTP Endpoints:');
   console.log('');
   console.log('  Auth:');
   console.log(`    GET  /auth/me              - Current user info`);
+  console.log(`    POST /connect/token        - Generate unsigned connection key (metadata)`);
   console.log('');
   console.log('  Database:');
   console.log(`    GET  /db/:table            - Query records`);
@@ -81,6 +81,7 @@ async function main() {
   console.log('');
   console.log('  Health:');
   console.log(`    GET  /health               - Service health (no auth)`);
+  console.log(`    GET  /ui                   - Built-in key/token web UI`);
   console.log('');
   console.log('═══════════════════════════════════════════════════════════');
   console.log('');
@@ -88,7 +89,7 @@ async function main() {
   console.log('');
   console.log('  auth_whoami, db_query, db_insert, db_update, db_delete,');
   console.log('  storage_upload, storage_download, storage_list, storage_delete,');
-  console.log('  function_invoke, fetch_delegated_records, health');
+  console.log('  function_invoke, generate_connection_token, fetch_delegated_records, health');
   console.log('');
   console.log('═══════════════════════════════════════════════════════════');
   console.log('');

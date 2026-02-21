@@ -1,8 +1,8 @@
-# Flux Adaptor - SuperBased Access Point for Fluxbase
+# SuperBased Service - SuperBased Access Point for Fluxbase
 
 ## Overview
 
-Flux Adaptor is a Nostr-native gateway that provides access to a Fluxbase backend via:
+SuperBased Service is a Nostr-native gateway that provides access to a Fluxbase backend via:
 1. **Direct HTTP** - Fast path for when you have network access
 2. **Nostr/CVM** - Private path via Nostr relays (works behind NAT, no domain needed)
 
@@ -26,7 +26,7 @@ Both paths use **NIP-98** authentication - users sign requests with their Nostr 
              └──────────────┬───────────────┘
                             ▼
               ┌─────────────────────────┐
-              │     FLUX ADAPTOR        │
+              │     SUPERBASED SERVICE        │
               │  ┌───────────────────┐  │
               │  │  NIP-98 Verifier  │  │
               │  └─────────┬─────────┘  │
@@ -251,7 +251,7 @@ For subsequent requests:
 ## Future: Home Sync
 
 For backing up cloud → home:
-1. Home instance runs same Flux Adaptor + Fluxbase
+1. Home instance runs same SuperBased Service + Fluxbase
 2. Sync service periodically pulls from cloud Fluxbase
 3. Both instances accessible via same npub (Nostr relays)
 4. Client can specify preferred endpoint or auto-failover

@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * CLI tool to register a new app with the flux adaptor
+ * CLI tool to register a new app with the superbased service
  *
  * Usage:
  *   bun run src/cli/create-app.ts --name todo-flux --nsec nsec1... --server https://...

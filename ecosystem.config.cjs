@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: 'flux-adaptor',
+      name: 'superbased-service',
       cwd: '/Users/mini/code/superbased/flux_adaptor',
       script: 'bun',
       args: 'start',

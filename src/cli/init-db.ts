@@ -88,6 +88,27 @@ async function main() {
   `;
   console.log('  done');
 
+  // ── superbased_push_subscriptions ──
+  console.log('Creating superbased_push_subscriptions...');
+  await sql`
+    CREATE TABLE IF NOT EXISTS superbased_push_subscriptions (
+      id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      app_pubkey      text NOT NULL,
+      owner_pubkey    text NOT NULL,
+      endpoint        text NOT NULL,
+      p256dh          text NOT NULL,
+      auth            text NOT NULL,
+      collections     text[] NOT NULL DEFAULT ARRAY[]::text[],
+      device_id       text,
+      user_agent      text,
+      created_at      timestamptz NOT NULL DEFAULT now(),
+      updated_at      timestamptz NOT NULL DEFAULT now(),
+      last_success_at timestamptz,
+      last_error_at   timestamptz
+    )
+  `;
+  console.log('  done');
+
   // ── Indexes ──
   console.log('\nCreating indexes...');
 
@@ -114,6 +135,18 @@ async function main() {
   await sql`
     CREATE INDEX IF NOT EXISTS idx_records_v3_delegates
       ON superbased_records_v3 USING GIN (delegate_payloads)
+  `;
+
+  console.log('  uq_push_subscription_endpoint...');
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_push_subscription_endpoint
+      ON superbased_push_subscriptions (app_pubkey, owner_pubkey, endpoint)
+  `;
+
+  console.log('  idx_push_owner_app...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_push_owner_app
+      ON superbased_push_subscriptions (app_pubkey, owner_pubkey)
   `;
 
   console.log('  done');
