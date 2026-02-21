@@ -6,8 +6,6 @@ export interface AuthContext {
   npub: string;          // Bech32 npub (or 'service' for service token)
   isAdmin: boolean;      // Is this an admin user
   isServiceToken?: boolean; // True if authenticated via SERVICE_TOKEN
-  fluxbaseUserId?: string;  // Mapped Fluxbase user ID
-  fluxbaseJwt?: string;     // JWT for Fluxbase requests
 }
 
 // NIP-98 verification result
@@ -17,76 +15,11 @@ export interface Nip98Result {
   error?: string;
 }
 
-// Fluxbase user mapping
-export interface UserMapping {
-  npub: string;
-  pubkeyHex: string;
-  fluxbaseUserId: string;
-  createdAt: Date;
-}
-
 // Generic API response
 export interface ApiResponse<T = unknown> {
   success: boolean;
   data?: T;
   error?: string;
-}
-
-// Database operation types
-export interface DbQueryParams {
-  table: string;
-  select?: string;
-  filter?: Record<string, unknown>;
-  order?: { column: string; ascending?: boolean };
-  limit?: number;
-  offset?: number;
-}
-
-export interface DbInsertParams {
-  table: string;
-  data: Record<string, unknown> | Record<string, unknown>[];
-}
-
-export interface DbUpdateParams {
-  table: string;
-  filter: Record<string, unknown>;
-  data: Record<string, unknown>;
-}
-
-export interface DbDeleteParams {
-  table: string;
-  filter: Record<string, unknown>;
-}
-
-// Storage operation types
-export interface StorageUploadParams {
-  bucket: string;
-  path: string;
-  content: string | Uint8Array;
-  contentType?: string;
-}
-
-export interface StorageDownloadParams {
-  bucket: string;
-  path: string;
-}
-
-export interface StorageListParams {
-  bucket: string;
-  prefix?: string;
-  limit?: number;
-  offset?: number;
-}
-
-export interface StorageDeleteParams {
-  bucket: string;
-  path: string;
-}
-
-// Function invocation
-export interface FunctionInvokeParams {
-  name: string;
-  payload?: unknown;
 }
 
 // MCP Tool definitions
@@ -139,6 +72,14 @@ export interface SyncResultV3 {
   created: number;
   updated: number;
   rejected: { record_id: string; reason: string }[];
+}
+
+// Internal sync outcome details for downstream side effects (e.g. push)
+export interface SyncOutcomeRecord {
+  record_id: string;
+  version: number;
+  owner_pubkey: string;
+  collection: string;
 }
 
 // Record as returned from fetch (owner's view)
@@ -251,3 +192,23 @@ export interface WritePermissionResult {
   reason?: string;
 }
 
+// ==================== PUSH TYPES ====================
+
+export interface PushSubscriptionInput {
+  endpoint: string;
+  expirationTime?: number | null;
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+}
+
+export interface PushSubscriptionUpsertInput {
+  subscription: PushSubscriptionInput;
+  collections?: string[];
+  device_id?: string;
+}
+
+export interface PushSubscriptionDeleteInput {
+  endpoint: string;
+}
