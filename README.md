@@ -1,263 +1,154 @@
 # SuperBased Service
 
-**Nostr-native gateway to Fluxbase** - Access your backend via HTTP or Nostr relays using cryptographic identity.
+Nostr-authenticated encrypted records service with dual transports:
+- HTTP (`src/transports/http.ts`)
+- MCP over Nostr/CVM (`src/transports/cvm.ts`)
 
-## Overview
+## Architecture (v3)
 
-SuperBased Service provides two access paths to a Fluxbase backend:
+The records layer is now direct Postgres with append-only versioned rows.
 
-1. **Direct HTTP** - Fast path when you have network access
-2. **Nostr/CVM** - Private path via Nostr relays (works behind NAT, no domain needed)
+- Storage table: `superbased_records_v3`
+- Record states: `live` -> `superseded` -> `deleted` (terminal)
+- Writes are atomic CTE transitions (supersede + insert in one query)
+- Delegated reads use GIN-indexed `delegate_payloads` JSONB lookups
+- `encrypted_from` is preserved across versions for decryption key derivation
 
-Both paths use **NIP-98** authentication - users sign requests with their Nostr keys. No passwords, no API keys in apps.
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     APP CLIENTS                             │
-│                                                             │
-│    ┌──────────────────┐         ┌──────────────────┐       │
-│    │   Fast Path      │         │   Private Path   │       │
-│    │   (HTTPS)        │         │   (Nostr/CVM)    │       │
-│    └────────┬─────────┘         └────────┬─────────┘       │
-└─────────────┼───────────────────────────┼───────────────────┘
-              │                            │
-              ▼                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│              SUPERBASED SERVICE                                   │
-│                                                             │
-│    ┌──────────────────────────────────────────────┐        │
-│    │            NIP-98 Verification               │        │
-│    │       (Cryptographic auth via Nostr)         │        │
-│    └──────────────────────┬───────────────────────┘        │
-│                           ▼                                 │
-│    ┌──────────────────────────────────────────────┐        │
-│    │       npub → Fluxbase User Mapping           │        │
-│    │      (Auto-create users on first request)    │        │
-│    └──────────────────────┬───────────────────────┘        │
-│                           ▼                                 │
-│    ┌──────────────────────────────────────────────┐        │
-│    │           Fluxbase API Client                │        │
-│    └──────────────────────┬───────────────────────┘        │
-└───────────────────────────┼─────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                       FLUXBASE                              │
-│           (Database, Storage, Functions, Realtime)          │
-└─────────────────────────────────────────────────────────────┘
-```
+Reference docs:
+- `CLAUDE.md` (service architecture + patterns)
+- `../sb_encrypted_records_spec.md` (record protocol/spec)
 
 ## Quick Start
 
-### 1. Install Dependencies
-
 ```bash
-cd flux_adaptor
 bun install
+cp .env.example .env
+bun run init
+bun run dev
 ```
 
-### 2. Configure
+Useful scripts:
+
+```bash
+bun run dev        # Hot reload
+bun run start      # Production start
+bun run init       # Create/upgrade DB tables + indexes
+bun run prune      # Prune superseded versions
+bun run typecheck  # TypeScript check
+bun run test       # Integration tests (requires Postgres)
+```
+
+## Docker
 
 ```bash
 cp .env.example .env
-# Edit .env with your Fluxbase URL and keys
-```
-
-### 3. Run
-
-```bash
-bun run dev   # Development with hot reload
-bun start     # Production
-```
-
-## Docker Deploy (New Server)
-
-This repo now includes a full Docker setup for:
-- `superbased-service` (the SuperBased service)
-- `postgres` (persistent database)
-
-### 1. Prepare env
-
-```bash
-cp .env.example .env
-```
-
-Set at minimum:
-- `SERVER_PRIVATE_KEY` (64-char hex, keep this stable per deployment)
-- Any relay/admin settings you want
-
-Postgres behavior:
-- If `POSTGRES_URL` is not set, compose defaults to bundled Postgres container (`postgres://postgres:postgres@postgres:5432/fluxbase`).
-- If you already have a Postgres instance with existing data, set `POSTGRES_URL` explicitly (for example `postgres://postgres:postgres@host.docker.internal:5432/fluxbase`).
-
-### 2. Start stack
-
-```bash
 docker compose up -d --build
-```
-
-### 3. Verify
-
-```bash
-docker compose ps
 curl http://localhost:3080/health
 ```
 
-### 4. Logs and updates
-
-```bash
-docker compose logs -f superbased-service
-docker compose pull
-docker compose up -d --build
-```
-
 Notes:
-- Postgres data is persisted in docker volume `postgres_data`.
-- Postgres is internal to Docker network by default (not exposed on host port `5432`).
-- DB schema is initialized automatically at service startup (`src/cli/init-db.ts`).
-- `pgcrypto` extension is created on first Postgres init (`docker/postgres-init/01-extensions.sql`).
-- If your old data is in another Postgres container/host, point `POSTGRES_URL` there before starting the stack.
+- If `POSTGRES_URL` is unset, compose uses bundled Postgres: `postgres://postgres:postgres@postgres:5432/fluxbase`
+- Data persists in `postgres_data` volume
+- Schema init runs via `src/cli/init-db.ts`
 
 ## Configuration
 
 | Variable | Description | Default |
-|----------|-------------|---------|
-| `FLUXBASE_URL` | Fluxbase server URL | `http://localhost:8090` |
-| `FLUXBASE_SERVICE_KEY` | Service role key for admin operations | - |
-| `HTTP_PORT` | HTTP server port | `3080` |
-| `NOSTR_RELAYS` | Comma-separated relay URLs | `wss://relay.damus.io` |
-| `SERVER_PRIVATE_KEY` | Server identity (hex, auto-generated if empty) | - |
+|---|---|---|
+| `HTTP_PORT` | HTTP port | `3080` |
+| `HTTP_HOST` | HTTP host bind | `0.0.0.0` |
+| `NOSTR_RELAYS` | Comma-separated relay URLs | `wss://relay.damus.io,wss://nos.lol` |
+| `SERVER_PRIVATE_KEY` | Server private key hex (auto-generated if empty) | - |
 | `ADMIN_NPUBS` | Comma-separated admin npubs | - |
+| `NIP98_MAX_AGE_SECONDS` | Max accepted NIP-98 auth event age | `60` |
+| `SERVICE_TOKEN` | Optional Bearer token for service-level access | - |
+| `POSTGRES_URL` | Postgres connection URL | `postgres://postgres:postgres@localhost:5432/fluxbase` |
+| `LOG_LEVEL` | Log level | `info` |
+| `PUSH_ENABLED` | Enable Web Push features | `false` |
+| `PUSH_VAPID_PUBLIC_KEY` | Web Push VAPID public key | - |
+| `PUSH_VAPID_PRIVATE_KEY` | Web Push VAPID private key | - |
+| `PUSH_VAPID_SUBJECT` | Web Push subject | - |
+
+## Authentication
+
+Protected endpoints/tools use NIP-98 auth:
+
+```txt
+Authorization: Nostr <base64-encoded-kind-27235-event>
+```
+
+Supported alternative for service integrations:
+
+```txt
+Authorization: Bearer <SERVICE_TOKEN>
+```
 
 ## HTTP API
 
-Protected endpoints require NIP-98 authentication. Public utility endpoints: `/health`, `/ui`, `/connect/token`.
+Public endpoints:
+- `GET /health`
+- `GET /ui`
+- `POST /connect/token`
 
-Built-in tools:
-- `GET /ui` - Browser UI to generate and decode connection keys
-- `POST /connect/token` - Generate an app-agnostic connection key (unsigned base64 JSON metadata)
+Core endpoints:
+- Auth: `GET /auth/me`
+- Apps: `POST /apps/register`, `GET /apps`, `GET /apps/:appNpub`, `POST /apps/:appNpub/token`
+- Delegations: `POST /delegations`, `GET /delegations`, `DELETE /delegations/:delegateNpub`
+- App delegations: `POST /apps/:appNpub/delegate`, `GET /apps/:appNpub/delegations`, `DELETE /apps/:appNpub/delegate/:delegateNpub`
+- Push (default namespace + app namespace): `/push/*`, `/apps/:appNpub/push/*`
+- Records (default namespace): `POST /records/sync`, `GET /records/fetch`, `GET /records/delegated`, `GET /records/history/:recordId`, `DELETE /records?record_id=...`
+- Records (per-app namespace): `POST /records/:appNpub/sync`, `GET /records/:appNpub/fetch`, `GET /records/:appNpub/delegated`, `GET /records/:appNpub/history/:recordId`, `DELETE /records/:appNpub?record_id=...`
 
-### Authentication
+Deprecated/stubbed endpoints (intentional `501`):
+- `/db/:table`
+- `/storage/:bucket/*`
+- `/functions/:name`
 
-Include a signed NIP-98 event in the Authorization header:
+## MCP Tools (CVM)
 
-```
-Authorization: Nostr <base64-encoded-event>
-```
+Implemented:
+- `health`
+- `auth_whoami`
+- `register_app`
+- `list_apps`
+- `get_app`
+- `generate_token`
+- `generate_connection_token`
+- `sync_records`
+- `fetch_records`
+- `fetch_delegated_records`
+- `delete_record`
+- `get_record_history`
 
-The event (kind 27235) must include:
-- `u` tag: Request URL
-- `method` tag: HTTP method
-- `payload` tag: SHA256 hash of body (for POST/PUT/PATCH)
+Stubbed (not implemented):
+- `db_query`, `db_insert`, `db_update`, `db_delete`
+- `storage_upload`, `storage_download`, `storage_list`, `storage_delete`
+- `function_invoke`
 
-### Endpoints
+## Testing
 
-#### Auth
-```
-GET /auth/me              # Current user info
-POST /connect/token       # Generate connection key (metadata only)
-```
+Integration tests run against real Postgres.
 
-#### Database
-```
-GET    /db/:table         # Query records
-POST   /db/:table         # Insert records
-PATCH  /db/:table         # Update records (filter in query string)
-DELETE /db/:table         # Delete records (filter in query string)
-```
+Default DB:
+- `postgres://postgres:postgres@localhost:5432/fluxbase`
 
-#### Storage
-```
-POST   /storage/:bucket/* # Upload file
-GET    /storage/:bucket/* # Download file
-GET    /storage/:bucket   # List files
-DELETE /storage/:bucket/* # Delete file
-```
+Override with:
+- `POSTGRES_URL`
 
-#### Functions
-```
-POST   /functions/:name   # Invoke edge function
-```
-
-## MCP Tools (via Nostr/CVM)
-
-When connecting via Nostr relays, these MCP tools are available:
-
-| Tool | Description |
-|------|-------------|
-| `health` | Check service health |
-| `auth_whoami` | Get current user info |
-| `db_query` | Query database records |
-| `db_insert` | Insert database records |
-| `db_update` | Update database records |
-| `db_delete` | Delete database records |
-| `storage_upload` | Upload file (base64 content) |
-| `storage_download` | Download file |
-| `storage_list` | List files in bucket |
-| `storage_delete` | Delete file |
-| `function_invoke` | Invoke edge function |
-
-## Use Cases
-
-### 1. Standard Web App
-Direct HTTPS for best performance:
-```typescript
-const response = await fetch('https://api.example.com/db/posts', {
-  headers: {
-    'Authorization': `Nostr ${base64Event}`,
-  },
-});
-```
-
-### 2. Privacy-Focused App
-Route through Nostr relays:
-```typescript
-// Connect to SuperBased Service via CVM
-const client = new CvmClient({
-  serverNpub: 'npub1...',
-  relays: ['wss://relay.damus.io'],
-});
-
-const posts = await client.call('db_query', {
-  table: 'posts',
-  filter: { published: true },
-});
-```
-
-### 3. Home Server (No Domain)
-Run Fluxbase + SuperBased Service at home, access via Nostr:
-- No domain name needed
-- No port forwarding required
-- Works behind any NAT
-
-### 4. Cloud + Local Backup
-- Cloud instance for production
-- Home instance synced as backup
-- Same npub works on both
-
-## Security
-
-- **NIP-98**: Cryptographic request signing (no passwords)
-- **User Mapping**: npub → Fluxbase user (auto-created)
-- **Short-lived JWTs**: Generated per-request
-- **Admin Control**: Configurable admin npubs
-
-## Development
+Run:
 
 ```bash
-bun run dev          # Start with hot reload
-bun run typecheck    # Type check
+bun test src/__tests__/
+bun test src/__tests__/records-service.test.ts
+bun test src/__tests__/prune-records.test.ts
 ```
 
-## Roadmap
-
-- [ ] Full CVM protocol implementation with @contextvm/sdk
-- [ ] Realtime subscriptions bridge
-- [ ] Rate limiting per npub
-- [ ] Usage tracking / billing hooks
-- [ ] Multi-workspace support
+Coverage focus:
+- append-only sync/versioning
+- deletion terminal behavior
+- delegated privacy constraints
+- history behavior
+- prune threshold and idempotency
 - [ ] Home ↔ Cloud sync
 
 ## License
