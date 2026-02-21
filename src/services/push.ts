@@ -4,6 +4,7 @@ import { getDb } from '../db/postgres';
 import type { PushSubscriptionInput, SyncOutcomeRecord } from '../types';
 
 const PUSH_TABLE = 'superbased_push_subscriptions';
+const NOTIFIABLE_COLLECTIONS = new Set(['chat_messages', 'ai_summaries']);
 
 type StoredPushSubscription = {
   endpoint: string;
@@ -97,12 +98,15 @@ export class PushService {
   async notifyOnSyncOutcomes(appPubkey: string, actorPubkey: string, outcomes: SyncOutcomeRecord[]): Promise<void> {
     if (!this.isConfigured || outcomes.length === 0) return;
 
-    const newRemoteChatRecords = outcomes.filter(
-      (o) => o.collection === 'chat_messages' && o.version === 1 && o.owner_pubkey !== actorPubkey
+    const newRemoteNotifiableRecords = outcomes.filter(
+      (o) =>
+        NOTIFIABLE_COLLECTIONS.has(o.collection) &&
+        o.version === 1 &&
+        o.owner_pubkey !== actorPubkey
     );
-    if (newRemoteChatRecords.length === 0) return;
+    if (newRemoteNotifiableRecords.length === 0) return;
 
-    for (const outcome of newRemoteChatRecords) {
+    for (const outcome of newRemoteNotifiableRecords) {
       await this.notifyOwnerForRecord(appPubkey, actorPubkey, outcome);
     }
   }
@@ -112,7 +116,7 @@ export class PushService {
     if (subscriptions.length === 0) return;
 
     const payload = JSON.stringify({
-      type: 'chat_message_created',
+      type: `${outcome.collection}_created`,
       app_pubkey: appPubkey,
       collection: outcome.collection,
       record_id: outcome.record_id,
@@ -123,7 +127,7 @@ export class PushService {
 
     for (const sub of subscriptions) {
       const allowedCollections = sub.collections || [];
-      if (allowedCollections.length > 0 && !allowedCollections.includes('chat_messages')) {
+      if (allowedCollections.length > 0 && !allowedCollections.includes(outcome.collection)) {
         continue;
       }
 

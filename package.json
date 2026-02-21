@@ -1,5 +1,5 @@
 {
-  "name": "flux-adaptor",
+  "name": "superbased-service",
   "version": "0.1.0",
   "description": "Nostr-native gateway to Fluxbase - access your backend via HTTP or Nostr relays",
   "type": "module",

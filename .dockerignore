@@ -1,0 +1,12 @@
+node_modules
+.git
+.gitignore
+logs
+tmp
+.env
+.env.*
+!.env.example
+README.md
+PLAN.md
+CLAUDE.md
+docs

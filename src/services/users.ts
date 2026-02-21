@@ -1,5 +1,4 @@
-import { FluxbaseClient } from '../fluxbase/client';
-import { getConfig } from '../config';
+import { getDb } from '../db/postgres';
 import type { UserInfo, UserAccessResult } from '../types';
 
 /**
@@ -11,46 +10,27 @@ export class UsersService {
    * Auto-creates with balance=5000, whitelist=true on first access.
    */
   async getOrCreateUser(userPubkeyHex: string): Promise<UserInfo> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
     // Try to find existing user
-    const existing = await client.query({
-      table: 'superbased_users',
-      filter: { user_pubkey: userPubkeyHex },
-      limit: 1,
-    });
+    const existing = await sql`
+      SELECT * FROM superbased_users
+      WHERE user_pubkey = ${userPubkeyHex}
+      LIMIT 1
+    `;
 
-    if (existing.data?.length) {
-      return existing.data[0] as UserInfo;
+    if (existing.length > 0) {
+      return existing[0] as unknown as UserInfo;
     }
 
-    // Create new user with defaults
-    const result = await client.insert({
-      table: 'superbased_users',
-      data: {
-        user_pubkey: userPubkeyHex,
-        balance: 5000,
-        whitelist: true,
-      },
-    });
+    // Create new user with defaults and return it
+    const inserted = await sql`
+      INSERT INTO superbased_users (user_pubkey, balance, whitelist)
+      VALUES (${userPubkeyHex}, 5000, true)
+      RETURNING *
+    `;
 
-    if (result.error) {
-      throw new Error(`Failed to create user: ${result.error}`);
-    }
-
-    // Fetch and return the created user
-    const created = await client.query({
-      table: 'superbased_users',
-      filter: { user_pubkey: userPubkeyHex },
-      limit: 1,
-    });
-
-    if (!created.data?.length) {
-      throw new Error('User created but not found');
-    }
-
-    return created.data[0] as UserInfo;
+    return inserted[0] as unknown as UserInfo;
   }
 
   /**
@@ -89,40 +69,36 @@ export class UsersService {
    * Get user by pubkey (returns null if not found)
    */
   async getUser(userPubkeyHex: string): Promise<UserInfo | null> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
-    const result = await client.query({
-      table: 'superbased_users',
-      filter: { user_pubkey: userPubkeyHex },
-      limit: 1,
-    });
+    const rows = await sql`
+      SELECT * FROM superbased_users
+      WHERE user_pubkey = ${userPubkeyHex}
+      LIMIT 1
+    `;
 
-    if (!result.data?.length) {
+    if (rows.length === 0) {
       return null;
     }
 
-    return result.data[0] as UserInfo;
+    return rows[0] as unknown as UserInfo;
   }
 
   /**
    * Update user balance
    */
   async updateBalance(userPubkeyHex: string, newBalance: number): Promise<void> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
-    const result = await client.update({
-      table: 'superbased_users',
-      filter: { user_pubkey: userPubkeyHex },
-      data: {
-        balance: newBalance,
-        updated_at: new Date().toISOString(),
-      },
-    });
+    const result = await sql`
+      UPDATE superbased_users
+      SET balance = ${newBalance},
+          updated_at = now()
+      WHERE user_pubkey = ${userPubkeyHex}
+    `;
 
-    if (result.error) {
-      throw new Error(`Failed to update balance: ${result.error}`);
+    if (result.count === 0) {
+      throw new Error('Failed to update balance: user not found');
     }
   }
 
@@ -130,20 +106,17 @@ export class UsersService {
    * Update user whitelist status
    */
   async setWhitelist(userPubkeyHex: string, whitelisted: boolean): Promise<void> {
-    const config = getConfig();
-    const client = new FluxbaseClient(config.fluxbaseServiceKey);
+    const sql = getDb();
 
-    const result = await client.update({
-      table: 'superbased_users',
-      filter: { user_pubkey: userPubkeyHex },
-      data: {
-        whitelist: whitelisted,
-        updated_at: new Date().toISOString(),
-      },
-    });
+    const result = await sql`
+      UPDATE superbased_users
+      SET whitelist = ${whitelisted},
+          updated_at = now()
+      WHERE user_pubkey = ${userPubkeyHex}
+    `;
 
-    if (result.error) {
-      throw new Error(`Failed to update whitelist: ${result.error}`);
+    if (result.count === 0) {
+      throw new Error('Failed to update whitelist: user not found');
     }
   }
 }

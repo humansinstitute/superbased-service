@@ -16,9 +16,10 @@ import type { AuthContext, SyncRecordInputV3 } from '../types';
 // ── Fixtures ──────────────────────────────────────────────────
 
 const TABLE = 'superbased_records_v3';
+const TEST_RUN_ID = process.env.FLUX_TEST_RUN_ID || 'local';
 
-const APP = 'aaaa'.repeat(16); // 64-char hex app pubkey
-const APP2 = 'bbbb'.repeat(16);
+const APP = `test_app_${TEST_RUN_ID}_a`;
+const APP2 = `test_app_${TEST_RUN_ID}_b`;
 
 const OWNER_PK = '1111'.repeat(16);
 const DELEGATE_PK = '2222'.repeat(16);
@@ -80,9 +81,12 @@ afterAll(async () => {
 });
 
 beforeEach(async () => {
-  // Truncate between tests for isolation
+  // Delete only this suite's rows for isolation (avoid broad table truncation)
   const sql = getDb();
-  await sql`TRUNCATE ${sql(TABLE)}`;
+  await sql`
+    DELETE FROM ${sql(TABLE)}
+    WHERE app_pubkey IN (${APP}, ${APP2})
+  `;
 
   // Default: no delegations exist (getDelegation returns null)
   getDelegationSpy = spyOn(delegationsService, 'getDelegation');

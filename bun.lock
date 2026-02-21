@@ -2,7 +2,7 @@
   "lockfileVersion": 1,
   "workspaces": {
     "": {
-      "name": "flux-adaptor",
+      "name": "superbased-service",
       "dependencies": {
         "@contextvm/sdk": "0.2.10",
         "@modelcontextprotocol/sdk": "^1.11.0",

@@ -11,7 +11,8 @@ import { describe, test, expect, beforeAll, afterAll, beforeEach } from 'bun:tes
 import { getDb, closeDb } from '../db/postgres';
 
 const TABLE = 'superbased_records_v3';
-const APP = 'pppp'.repeat(16);
+const TEST_RUN_ID = process.env.FLUX_TEST_RUN_ID || 'local';
+const APP = `test_prune_app_${TEST_RUN_ID}`;
 const USER = 'uuuu'.repeat(16);
 
 // ── Setup ─────────────────────────────────────────────────────
@@ -45,7 +46,7 @@ afterAll(async () => {
 
 beforeEach(async () => {
   const sql = getDb();
-  await sql`TRUNCATE ${sql(TABLE)}`;
+  await sql`DELETE FROM ${sql(TABLE)} WHERE app_pubkey = ${APP}`;
 });
 
 // ── Helpers ───────────────────────────────────────────────────

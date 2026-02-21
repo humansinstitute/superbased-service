@@ -1,10 +1,10 @@
-# Flux Adaptor
+# SuperBased Service
 
 **Nostr-native gateway to Fluxbase** - Access your backend via HTTP or Nostr relays using cryptographic identity.
 
 ## Overview
 
-Flux Adaptor provides two access paths to a Fluxbase backend:
+SuperBased Service provides two access paths to a Fluxbase backend:
 
 1. **Direct HTTP** - Fast path when you have network access
 2. **Nostr/CVM** - Private path via Nostr relays (works behind NAT, no domain needed)
@@ -25,7 +25,7 @@ Both paths use **NIP-98** authentication - users sign requests with their Nostr 
               │                            │
               ▼                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│              FLUX ADAPTOR                                   │
+│              SUPERBASED SERVICE                                   │
 │                                                             │
 │    ┌──────────────────────────────────────────────┐        │
 │    │            NIP-98 Verification               │        │
@@ -72,6 +72,54 @@ bun run dev   # Development with hot reload
 bun start     # Production
 ```
 
+## Docker Deploy (New Server)
+
+This repo now includes a full Docker setup for:
+- `superbased-service` (the SuperBased service)
+- `postgres` (persistent database)
+
+### 1. Prepare env
+
+```bash
+cp .env.example .env
+```
+
+Set at minimum:
+- `SERVER_PRIVATE_KEY` (64-char hex, keep this stable per deployment)
+- Any relay/admin settings you want
+
+Postgres behavior:
+- If `POSTGRES_URL` is not set, compose defaults to bundled Postgres container (`postgres://postgres:postgres@postgres:5432/fluxbase`).
+- If you already have a Postgres instance with existing data, set `POSTGRES_URL` explicitly (for example `postgres://postgres:postgres@host.docker.internal:5432/fluxbase`).
+
+### 2. Start stack
+
+```bash
+docker compose up -d --build
+```
+
+### 3. Verify
+
+```bash
+docker compose ps
+curl http://localhost:3080/health
+```
+
+### 4. Logs and updates
+
+```bash
+docker compose logs -f superbased-service
+docker compose pull
+docker compose up -d --build
+```
+
+Notes:
+- Postgres data is persisted in docker volume `postgres_data`.
+- Postgres is internal to Docker network by default (not exposed on host port `5432`).
+- DB schema is initialized automatically at service startup (`src/cli/init-db.ts`).
+- `pgcrypto` extension is created on first Postgres init (`docker/postgres-init/01-extensions.sql`).
+- If your old data is in another Postgres container/host, point `POSTGRES_URL` there before starting the stack.
+
 ## Configuration
 
 | Variable | Description | Default |
@@ -85,7 +133,11 @@ bun start     # Production
 
 ## HTTP API
 
-All endpoints (except `/health`) require NIP-98 authentication.
+Protected endpoints require NIP-98 authentication. Public utility endpoints: `/health`, `/ui`, `/connect/token`.
+
+Built-in tools:
+- `GET /ui` - Browser UI to generate and decode connection keys
+- `POST /connect/token` - Generate an app-agnostic connection key (unsigned base64 JSON metadata)
 
 ### Authentication
 
@@ -105,6 +157,7 @@ The event (kind 27235) must include:
 #### Auth
 ```
 GET /auth/me              # Current user info
+POST /connect/token       # Generate connection key (metadata only)
 ```
 
 #### Database
@@ -161,7 +214,7 @@ const response = await fetch('https://api.example.com/db/posts', {
 ### 2. Privacy-Focused App
 Route through Nostr relays:
 ```typescript
-// Connect to Flux Adaptor via CVM
+// Connect to SuperBased Service via CVM
 const client = new CvmClient({
   serverNpub: 'npub1...',
   relays: ['wss://relay.damus.io'],
@@ -174,7 +227,7 @@ const posts = await client.call('db_query', {
 ```
 
 ### 3. Home Server (No Domain)
-Run Fluxbase + Flux Adaptor at home, access via Nostr:
+Run Fluxbase + SuperBased Service at home, access via Nostr:
 - No domain name needed
 - No port forwarding required
 - Works behind any NAT

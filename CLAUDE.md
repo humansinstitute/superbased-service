@@ -1,4 +1,4 @@
-# Flux Adaptor - Project Instructions
+# SuperBased Service - Project Instructions
 
 ## Architecture
 

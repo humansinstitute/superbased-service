@@ -1,6 +1,6 @@
 openapi: 3.1.0
 info:
-  title: Flux Adaptor API
+  title: SuperBased Service API
   version: 0.1.0
   description: |
     Nostr-native gateway to Fluxbase. Provides access to database, storage,
@@ -46,7 +46,8 @@ info:
     ## DER (Delegated Encrypted Records)
 
     Records follow the DER specification for multi-recipient encrypted storage.
-    See the `/records/{appNpub}/delegated` endpoint for delegate access.
+    Prefer the app-less endpoints (`/records/*`, `/delegations*`, `/push/*`).
+    Legacy app-scoped endpoints (`/{appNpub}`) remain for backward compatibility.
 
   contact:
     name: SuperBased
@@ -55,7 +56,7 @@ info:
 
 servers:
   - url: '{protocol}://{host}:{port}'
-    description: Flux Adaptor instance
+    description: SuperBased Service instance
     variables:
       protocol:
         default: http
@@ -68,6 +69,8 @@ servers:
 tags:
   - name: Health
     description: Service health checks (no auth required)
+  - name: Connect
+    description: Connection bootstrap helpers (UI + token)
   - name: Auth
     description: Authentication and identity
   - name: Database
@@ -110,7 +113,7 @@ paths:
                     example: ok
                   adaptor:
                     type: string
-                    example: flux-adaptor
+                    example: superbased-service
                   serverNpub:
                     type: string
                     description: Server's Nostr npub (bech32)
@@ -122,6 +125,23 @@ paths:
                         type: boolean
                       details:
                         type: object
+
+  /ui:
+    get:
+      operationId: getConnectionUi
+      tags: [Connect]
+      summary: Built-in connection web UI
+      description: |
+        Returns a browser UI that can generate and decode app-agnostic
+        connection keys for quick copy/paste into apps.
+      security: []
+      responses:
+        '200':
+          description: HTML page
+          content:
+            text/html:
+              schema:
+                type: string
 
   # ───────────────────── Auth ─────────────────────
   /auth/me:
@@ -138,6 +158,340 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AuthInfo'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /connect/token:
+    post:
+      operationId: generateConnectionToken
+      tags: [Connect]
+      summary: Generate app-agnostic connection token
+      description: |
+        Generates an unsigned base64-encoded JSON connection key with endpoint
+        metadata (server, relay, HTTP endpoint, expiry hint). This key is not
+        an auth credential and does not replace per-request NIP-98 auth.
+      security: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                relay:
+                  type: string
+                  description: Relay URL for CVM access
+                http:
+                  type: string
+                  description: Preferred HTTP endpoint URL
+                ttl_seconds:
+                  type: integer
+                  minimum: 60
+                  maximum: 31536000
+                  description: Token TTL in seconds
+                scopes:
+                  type: array
+                  items:
+                    type: string
+                  description: Optional advisory scope labels
+      responses:
+        '200':
+          description: Generated connection token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                    description: Base64-encoded JSON connection key
+
+  # ───────────────────── Delegations (App-less) ─────────────────────
+  /delegations:
+    post:
+      operationId: grantDelegationDefault
+      tags: [Delegations]
+      summary: Grant delegation (default namespace)
+      description: |
+        App-less delegation endpoint. Uses the server default namespace.
+        Preferred for new integrations.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateDelegationInput'
+      responses:
+        '201':
+          description: Delegation created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DelegationResult'
+        '200':
+          description: Delegation updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DelegationResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    get:
+      operationId: listDelegationsDefault
+      tags: [Delegations]
+      summary: List delegations (default namespace)
+      responses:
+        '200':
+          description: Active delegations
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  delegations:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AppDelegation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /delegations/{delegateNpub}:
+    parameters:
+      - name: delegateNpub
+        in: path
+        required: true
+        schema:
+          type: string
+    delete:
+      operationId: revokeDelegationDefault
+      tags: [Delegations]
+      summary: Revoke delegation (default namespace)
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+        '404':
+          description: Delegation not found or already revoked
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ───────────────────── Push (App-less) ─────────────────────
+  /push/config:
+    get:
+      operationId: getPushConfigDefault
+      tags: [Records]
+      summary: Get push configuration (default namespace)
+      responses:
+        '200':
+          description: Push config
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  vapid_public_key:
+                    type: string
+                    nullable: true
+                  collections:
+                    type: array
+                    items:
+                      type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /push/subscribe:
+    post:
+      operationId: subscribePushDefault
+      tags: [Records]
+      summary: Register push subscription (default namespace)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Subscribed
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /push/unsubscribe:
+    post:
+      operationId: unsubscribePushDefault
+      tags: [Records]
+      summary: Remove push subscription (default namespace)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [endpoint]
+              properties:
+                endpoint:
+                  type: string
+      responses:
+        '200':
+          description: Unsubscribed
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /push/subscriptions:
+    get:
+      operationId: listPushSubscriptionsDefault
+      tags: [Records]
+      summary: List push subscriptions (default namespace)
+      responses:
+        '200':
+          description: Subscriptions
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ───────────────────── Records (App-less) ─────────────────────
+  /records/sync:
+    post:
+      operationId: syncRecordsDefault
+      tags: [Records]
+      summary: Sync encrypted records (default namespace)
+      description: Preferred app-less sync endpoint.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [records]
+              properties:
+                records:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/SyncRecordInput'
+      responses:
+        '200':
+          description: Sync result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /records/fetch:
+    get:
+      operationId: fetchRecordsDefault
+      tags: [Records]
+      summary: Fetch own records (default namespace)
+      parameters:
+        - name: collection
+          in: query
+          schema:
+            type: string
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Records
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/FetchResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /records/delegated:
+    get:
+      operationId: fetchDelegatedRecordsDefault
+      tags: [Records]
+      summary: Fetch delegated records (default namespace)
+      parameters:
+        - name: collection
+          in: query
+          schema:
+            type: string
+        - name: owner
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Delegated records
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DelegatedFetchResult'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /records/history/{recordId}:
+    parameters:
+      - name: recordId
+        in: path
+        required: true
+        schema:
+          type: string
+    get:
+      operationId: getRecordHistoryDefault
+      tags: [Records]
+      summary: Get record history (default namespace)
+      parameters:
+        - name: include_data
+          in: query
+          schema:
+            type: string
+            enum: ['true', 'false']
+      responses:
+        '200':
+          description: History result
+        '404':
+          description: Record not found
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /records:
+    delete:
+      operationId: deleteRecordDefault
+      tags: [Records]
+      summary: Delete one record (default namespace)
+      parameters:
+        - name: record_id
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deletion result
+        '404':
+          description: Record not found or already deleted
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '401':
           $ref: '#/components/responses/Unauthorized'
 

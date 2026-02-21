@@ -20,8 +20,7 @@ import { nip19 } from 'nostr-tools';
 
 import { getConfig } from '../config';
 import { createAuthContext } from '../auth/nip98';
-import { getOrCreateFluxbaseUser, generateFluxbaseJwt } from '../auth/user-mapping';
-import { FluxbaseClient } from '../fluxbase/client';
+import { getDb } from '../db/postgres';
 import { appsService } from '../services/apps';
 import { recordsService } from '../services/records';
 import type { AuthContext, SyncRecordInputV3 } from '../types';
@@ -57,12 +56,7 @@ async function getAuthFromExtra(extra: unknown): Promise<AuthContext> {
     throw new Error('Authentication required - no client pubkey found');
   }
 
-  // Create auth context and set up Fluxbase user
-  let auth = createAuthContext(pubkeyHex);
-  auth = await getOrCreateFluxbaseUser(auth);
-  auth.fluxbaseJwt = await generateFluxbaseJwt(auth) ?? undefined;
-
-  return auth;
+  return createAuthContext(pubkeyHex);
 }
 
 /**
@@ -122,15 +116,21 @@ function registerTools(server: McpServer) {
   // Health check (no auth required)
   server.tool(
     'health',
-    'Check service health and Fluxbase connection',
+    'Check service health and database connection',
     {},
     async () => {
-      const client = new FluxbaseClient();
-      const health = await client.health();
+      let dbHealthy = false;
+      try {
+        const sql = getDb();
+        await sql`SELECT 1`;
+        dbHealthy = true;
+      } catch {
+        // db unreachable
+      }
       return jsonContent({
-        status: 'ok',
-        adaptor: 'flux-adaptor',
-        fluxbase: health,
+        status: dbHealthy ? 'ok' : 'degraded',
+        adaptor: 'superbased-service',
+        postgres: { healthy: dbHealthy },
       });
     }
   );
@@ -146,228 +146,109 @@ function registerTools(server: McpServer) {
         npub: auth.npub,
         pubkey: auth.pubkey,
         isAdmin: auth.isAdmin,
-        fluxbaseUserId: auth.fluxbaseUserId,
       });
     }
   );
 
-  // Database - query
+  // Database tools (stubbed)
   server.tool(
     'db_query',
-    'Query records from a database table',
+    'Query records from a database table (not implemented)',
     {
       table: z.string().describe('Table name to query'),
-      select: z.string().optional().describe('Columns to select (comma-separated)'),
-      filter: z.record(z.unknown()).optional().describe('Filter conditions'),
-      order: z.object({
-        column: z.string(),
-        ascending: z.boolean().optional(),
-      }).optional().describe('Order by column'),
-      limit: z.number().optional().describe('Maximum records to return'),
-      offset: z.number().optional().describe('Number of records to skip'),
     },
-    async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const client = FluxbaseClient.forAuth(auth);
-      const result = await client.query(params);
-      if (result.error) {
-        throw new Error(result.error);
-      }
-      return jsonContent(result.data);
+    async () => {
+      throw new Error('Not implemented — direct DB proxy removed');
     }
   );
 
-  // Database - insert
   server.tool(
     'db_insert',
-    'Insert records into a database table',
+    'Insert records into a database table (not implemented)',
     {
       table: z.string().describe('Table name'),
-      data: z.union([
-        z.record(z.unknown()),
-        z.array(z.record(z.unknown())),
-      ]).describe('Record(s) to insert'),
     },
-    async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const client = FluxbaseClient.forAuth(auth);
-      const result = await client.insert({
-        table: params.table,
-        data: params.data as Record<string, unknown>,
-      });
-      if (result.error) {
-        throw new Error(result.error);
-      }
-      return jsonContent(result.data);
+    async () => {
+      throw new Error('Not implemented — direct DB proxy removed');
     }
   );
 
-  // Database - update
   server.tool(
     'db_update',
-    'Update records in a database table',
+    'Update records in a database table (not implemented)',
     {
       table: z.string().describe('Table name'),
-      filter: z.record(z.unknown()).describe('Filter to match records'),
-      data: z.record(z.unknown()).describe('Fields to update'),
     },
-    async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const client = FluxbaseClient.forAuth(auth);
-      const result = await client.update({
-        table: params.table,
-        filter: params.filter,
-        data: params.data,
-      });
-      if (result.error) {
-        throw new Error(result.error);
-      }
-      return jsonContent(result.data);
+    async () => {
+      throw new Error('Not implemented — direct DB proxy removed');
     }
   );
 
-  // Database - delete
   server.tool(
     'db_delete',
-    'Delete records from a database table',
+    'Delete records from a database table (not implemented)',
     {
       table: z.string().describe('Table name'),
-      filter: z.record(z.unknown()).describe('Filter to match records to delete'),
     },
-    async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const client = FluxbaseClient.forAuth(auth);
-      const result = await client.delete({
-        table: params.table,
-        filter: params.filter,
-      });
-      if (result.error) {
-        throw new Error(result.error);
-      }
-      return jsonContent({ success: true });
+    async () => {
+      throw new Error('Not implemented — direct DB proxy removed');
     }
   );
 
-  // Storage - upload
+  // Storage tools (stubbed)
   server.tool(
     'storage_upload',
-    'Upload a file to storage (content must be base64 encoded)',
+    'Upload a file to storage (not implemented)',
     {
       bucket: z.string().describe('Storage bucket name'),
-      path: z.string().describe('File path within bucket'),
-      content: z.string().describe('Base64 encoded file content'),
-      contentType: z.string().optional().describe('MIME type of the file'),
     },
-    async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const client = FluxbaseClient.forAuth(auth);
-
-      // Decode base64 content
-      const decoded = Uint8Array.from(atob(params.content), c => c.charCodeAt(0));
-
-      const result = await client.uploadFile(
-        params.bucket,
-        params.path,
-        decoded,
-        params.contentType || 'application/octet-stream'
-      );
-      if (result.error) {
-        throw new Error(result.error);
-      }
-      return jsonContent(result.data);
+    async () => {
+      throw new Error('Not implemented — storage proxy removed');
     }
   );
 
-  // Storage - download
   server.tool(
     'storage_download',
-    'Download a file from storage (returns base64 encoded content)',
+    'Download a file from storage (not implemented)',
     {
       bucket: z.string().describe('Storage bucket name'),
-      path: z.string().describe('File path within bucket'),
     },
-    async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const client = FluxbaseClient.forAuth(auth);
-
-      const result = await client.downloadFile(params.bucket, params.path);
-      if (result.error) {
-        throw new Error(result.error);
-      }
-
-      // Encode to base64 for transport
-      const base64 = btoa(String.fromCharCode(...(result.data || [])));
-      return jsonContent({
-        content: base64,
-        contentType: result.contentType,
-      });
+    async () => {
+      throw new Error('Not implemented — storage proxy removed');
     }
   );
 
-  // Storage - list
   server.tool(
     'storage_list',
-    'List files in a storage bucket',
+    'List files in a storage bucket (not implemented)',
     {
       bucket: z.string().describe('Storage bucket name'),
-      prefix: z.string().optional().describe('Filter by path prefix'),
-      limit: z.number().optional().describe('Maximum files to return'),
-      offset: z.number().optional().describe('Number of files to skip'),
     },
-    async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const client = FluxbaseClient.forAuth(auth);
-
-      const result = await client.listFiles(
-        params.bucket,
-        params.prefix,
-        params.limit,
-        params.offset
-      );
-      if (result.error) {
-        throw new Error(result.error);
-      }
-      return jsonContent(result.data);
+    async () => {
+      throw new Error('Not implemented — storage proxy removed');
     }
   );
 
-  // Storage - delete
   server.tool(
     'storage_delete',
-    'Delete a file from storage',
+    'Delete a file from storage (not implemented)',
     {
       bucket: z.string().describe('Storage bucket name'),
-      path: z.string().describe('File path to delete'),
     },
-    async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const client = FluxbaseClient.forAuth(auth);
-
-      const result = await client.deleteFile(params.bucket, params.path);
-      if (result.error) {
-        throw new Error(result.error);
-      }
-      return jsonContent({ success: true });
+    async () => {
+      throw new Error('Not implemented — storage proxy removed');
     }
   );
 
-  // Functions - invoke
+  // Functions (stubbed)
   server.tool(
     'function_invoke',
-    'Invoke a Fluxbase edge function',
+    'Invoke an edge function (not implemented)',
     {
       name: z.string().describe('Function name to invoke'),
-      payload: z.unknown().optional().describe('Payload to pass to the function'),
     },
-    async (params, extra) => {
-      const auth = await getAuthFromExtra(extra);
-      const client = FluxbaseClient.forAuth(auth);
-
-      const result = await client.invokeFunction(params.name, params.payload);
-      if (result.error) {
-        throw new Error(result.error);
-      }
-      return jsonContent(result.data);
+    async () => {
+      throw new Error('Not implemented — functions proxy removed');
     }
   );
 
@@ -431,6 +312,26 @@ function registerTools(server: McpServer) {
       const token = await appsService.generateToken(auth, params.app_npub, {
         relay: params.relay,
         http: params.http,
+      });
+      return jsonContent({ token });
+    }
+  );
+
+  server.tool(
+    'generate_connection_token',
+    'Generate app-agnostic connection token',
+    {
+      relay: z.string().optional().describe('Relay URL for CVM'),
+      http: z.string().optional().describe('HTTP endpoint URL'),
+      ttl_seconds: z.number().optional().describe('Token TTL in seconds'),
+      scopes: z.array(z.string()).optional().describe('Advisory scope labels'),
+    },
+    async (params, extra) => {
+      const token = await appsService.generateConnectionToken({
+        relay: params.relay,
+        http: params.http,
+        ttl_seconds: params.ttl_seconds,
+        scopes: params.scopes,
       });
       return jsonContent({ token });
     }
@@ -598,7 +499,7 @@ export async function startCvmTransport() {
 
   // Create the MCP server
   mcpServer = new McpServer({
-    name: 'flux-adaptor',
+    name: 'superbased-service',
     version: '0.1.0',
   });
 

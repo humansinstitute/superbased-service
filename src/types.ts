@@ -139,6 +139,14 @@ export interface TokenGenerationOptions {
   http?: string;
 }
 
+// Options for app-agnostic connection token generation
+export interface ConnectionTokenOptions {
+  relay?: string;
+  http?: string;
+  ttl_seconds?: number;
+  scopes?: string[];
+}
+
 // ==================== USER TYPES ====================
 
 // User info (stored in superbased_users table)
