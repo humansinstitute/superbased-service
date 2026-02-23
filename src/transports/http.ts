@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { nip19 } from 'nostr-tools';
+import { createHmac, timingSafeEqual } from 'node:crypto';
 import { getConfig } from '../config';
 import { verifyNip98, createAuthContext } from '../auth/nip98';
 import { getDb } from '../db/postgres';
@@ -9,14 +10,81 @@ import { recordsService } from '../services/records';
 import { usersService } from '../services/users';
 import { delegationsService } from '../services/delegations';
 import { pushService } from '../services/push';
-import { renderConnectionUiHtml } from './webui';
+import { usageReportService } from '../services/usage-report';
+import { storageService } from '../services/storage';
+import { renderConnectionUiHtml, renderUiLoginHtml, renderUsageReportUiHtml } from './webui';
 import type {
   AuthContext,
   SyncRecordInputV3,
   CreateDelegationInput,
   PushSubscriptionUpsertInput,
   PushSubscriptionDeleteInput,
+  StoragePrepareUploadInput,
+  StorageCompleteUploadInput,
 } from '../types';
+
+const qrBundleFile = Bun.file(new URL('./assets/qrcode.bundle.mjs', import.meta.url));
+
+interface UiSessionPayload {
+  pubkey: string;
+  exp: number;
+}
+
+function b64url(input: string): string {
+  return Buffer.from(input, 'utf8').toString('base64url');
+}
+
+function fromB64url(input: string): string {
+  return Buffer.from(input, 'base64url').toString('utf8');
+}
+
+function getSessionSecret(config: ReturnType<typeof getConfig>): string {
+  return config.serviceToken || Buffer.from(config.serverPrivateKey).toString('hex');
+}
+
+function signUiSession(payloadEncoded: string, secret: string): string {
+  return createHmac('sha256', secret).update(payloadEncoded).digest('base64url');
+}
+
+function createUiSessionToken(pubkey: string, config: ReturnType<typeof getConfig>): string {
+  const payload: UiSessionPayload = {
+    pubkey,
+    exp: Math.floor(Date.now() / 1000) + (7 * 24 * 60 * 60),
+  };
+  const payloadEncoded = b64url(JSON.stringify(payload));
+  const sig = signUiSession(payloadEncoded, getSessionSecret(config));
+  return `${payloadEncoded}.${sig}`;
+}
+
+function parseCookieValue(cookieHeader: string | undefined, key: string): string | null {
+  if (!cookieHeader) return null;
+  for (const part of cookieHeader.split(';')) {
+    const [k, ...rest] = part.trim().split('=');
+    if (k === key) return rest.join('=');
+  }
+  return null;
+}
+
+function verifyUiSessionToken(token: string | null, config: ReturnType<typeof getConfig>): UiSessionPayload | null {
+  if (!token) return null;
+  const [payloadEncoded, sig] = token.split('.');
+  if (!payloadEncoded || !sig) return null;
+
+  const expected = signUiSession(payloadEncoded, getSessionSecret(config));
+  const expectedBuf = Buffer.from(expected);
+  const sigBuf = Buffer.from(sig);
+  if (expectedBuf.length !== sigBuf.length) return null;
+  if (!timingSafeEqual(expectedBuf, sigBuf)) return null;
+
+  try {
+    const payload = JSON.parse(fromB64url(payloadEncoded)) as UiSessionPayload;
+    const now = Math.floor(Date.now() / 1000);
+    if (!payload.pubkey || payload.exp < now) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Resolve app npub to pubkey hex.
@@ -38,6 +106,14 @@ function resolveAppPubkey(appNpub: string): { pubkey: string } {
 function resolveDefaultNamespacePubkey(): string {
   const config = getConfig();
   return config.serverPublicKey;
+}
+
+function safeNpubEncode(pubkey: string): string | null {
+  try {
+    return nip19.npubEncode(pubkey);
+  } catch {
+    return null;
+  }
 }
 
 // Extend Hono context with auth
@@ -102,9 +178,79 @@ export function createHttpServer() {
     });
   });
 
-  // Simple built-in UI for key/token generation
+  // Admin UI (NIP-07 login required for report access)
   app.get('/ui', async (c) => {
+    const token = parseCookieValue(c.req.header('Cookie'), 'sb_ui_session');
+    const session = verifyUiSessionToken(token, config);
+    if (!session) {
+      return c.html(renderUiLoginHtml());
+    }
+    const auth = createAuthContext(session.pubkey);
+    if (!auth.isAdmin) {
+      return c.html(renderUiLoginHtml());
+    }
+    return c.html(renderUsageReportUiHtml());
+  });
+
+  // Legacy connection helper UI
+  app.get('/ui/connect', async (c) => {
     return c.html(renderConnectionUiHtml());
+  });
+
+  app.post('/ui/auth/login', async (c) => {
+    const authHeader = c.req.header('Authorization');
+    if (!authHeader) return c.json({ error: 'Missing Authorization header' }, 401);
+    const result = verifyNip98(authHeader, c.req.url, c.req.method);
+    if (!result.valid || !result.pubkey) return c.json({ error: result.error || 'Authentication failed' }, 401);
+
+    const auth = createAuthContext(result.pubkey);
+    if (!auth.isAdmin) {
+      return c.json({ error: 'Admin access required' }, 403);
+    }
+
+    const token = createUiSessionToken(result.pubkey, config);
+    c.header('Set-Cookie', `sb_ui_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800`);
+    return c.json({ ok: true, npub: auth.npub });
+  });
+
+  app.post('/ui/auth/logout', async (c) => {
+    c.header('Set-Cookie', 'sb_ui_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0');
+    return c.json({ ok: true });
+  });
+
+  app.get('/ui/report', async (c) => {
+    try {
+      const token = parseCookieValue(c.req.header('Cookie'), 'sb_ui_session');
+      const session = verifyUiSessionToken(token, config);
+      if (!session) return c.json({ error: 'Unauthorized' }, 401);
+
+      const auth = createAuthContext(session.pubkey);
+      if (!auth.isAdmin) return c.json({ error: 'Unauthorized' }, 401);
+
+      const report = await usageReportService.getLatestReport(1000);
+      const rows = report.rows.map((r) => ({
+        captured_hour: r.captured_hour,
+        user_pubkey: r.user_pubkey,
+        user_npub: safeNpubEncode(r.user_pubkey),
+        live_records: r.live_records,
+        retained_rows: r.retained_rows,
+        retained_bytes: r.retained_bytes,
+        encrypted_data_bytes: r.encrypted_data_bytes,
+        delegate_payload_bytes: r.delegate_payload_bytes,
+      }));
+
+      return c.json({ captured_hour: report.captured_hour, rows });
+    } catch (err: any) {
+      console.error('GET /ui/report failed:', err);
+      return c.json({ error: err?.message || String(err) }, 500);
+    }
+  });
+
+  // Static local QR module used by /ui (offline-friendly; no external CDN dependency)
+  app.get('/ui/assets/qrcode.bundle.mjs', async (c) => {
+    c.header('Content-Type', 'text/javascript; charset=utf-8');
+    c.header('Cache-Control', 'public, max-age=3600');
+    return c.body(await qrBundleFile.text());
   });
 
   // NIP-98 Auth middleware for protected routes
@@ -212,22 +358,114 @@ export function createHttpServer() {
     return c.json({ error: 'Not implemented — direct DB proxy removed' }, 501);
   });
 
-  // ==================== Storage Routes (stubbed) ====================
+  // ==================== Storage Routes ====================
 
-  app.post('/storage/:bucket/*', authMiddleware, async (c) => {
-    return c.json({ error: 'Not implemented — storage proxy removed' }, 501);
+  app.post('/storage/prepare-upload', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: StoragePrepareUploadInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const result = await storageService.prepareUpload(appPubkey, auth, input);
+      return c.json(result, 201);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
   });
 
-  app.get('/storage/:bucket/*', authMiddleware, async (c) => {
-    return c.json({ error: 'Not implemented — storage proxy removed' }, 501);
+  app.post('/storage/complete-upload', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: StorageCompleteUploadInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const result = await storageService.completeUpload(appPubkey, auth, input);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
   });
 
-  app.get('/storage/:bucket', authMiddleware, async (c) => {
-    return c.json({ error: 'Not implemented — storage proxy removed' }, 501);
+  app.get('/storage/list', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const limit = Number(c.req.query('limit') ?? 100);
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const objects = await storageService.listObjects(appPubkey, auth, limit);
+      return c.json({ objects });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
   });
 
-  app.delete('/storage/:bucket/*', authMiddleware, async (c) => {
-    return c.json({ error: 'Not implemented — storage proxy removed' }, 501);
+  app.get('/storage/usage', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const usage = await storageService.getUsage(appPubkey, auth);
+      return c.json(usage);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.get('/storage/:objectId/download-url', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const objectId = c.req.param('objectId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const result = await storageService.getDownloadUrl(appPubkey, auth, objectId);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 404);
+    }
+  });
+
+  app.delete('/storage/:objectId', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const objectId = c.req.param('objectId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const result = await storageService.deleteObject(appPubkey, auth, objectId);
+      if (!result.deleted) return c.json({ error: 'Object not found' }, 404);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
   });
 
   // ==================== Functions Routes (stubbed) ====================

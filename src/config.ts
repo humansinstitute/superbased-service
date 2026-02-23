@@ -27,6 +27,22 @@ export interface Config {
   pushVapidPublicKey: string | null;
   pushVapidPrivateKey: string | null;
   pushVapidSubject: string | null;
+
+  // Object Storage
+  storageEnabled: boolean;
+  storageS3Endpoint: string;
+  storageS3PublicEndpoint: string;
+  storageS3Region: string;
+  storageS3AccessKey: string;
+  storageS3SecretKey: string;
+  storageS3Bucket: string;
+  storageS3ForcePathStyle: boolean;
+  storagePresignUploadTtlSeconds: number;
+  storagePresignDownloadTtlSeconds: number;
+  storageDefaultTtlSeconds: number;
+  storageDeletedRetentionSeconds: number;
+  storageMaxObjectBytes: number;
+  storageMaxBytesPerNpub: number;
 }
 
 function getEnvOptional(key: string, defaultValue: string): string {
@@ -83,6 +99,25 @@ export function loadConfig(): Config {
     pushVapidPublicKey: process.env.PUSH_VAPID_PUBLIC_KEY || null,
     pushVapidPrivateKey: process.env.PUSH_VAPID_PRIVATE_KEY || null,
     pushVapidSubject: process.env.PUSH_VAPID_SUBJECT || null,
+
+    // Object Storage
+    storageEnabled: getEnvOptional('STORAGE_ENABLED', 'true') === 'true',
+    storageS3Endpoint: getEnvOptional('STORAGE_S3_ENDPOINT', 'http://localhost:9000'),
+    storageS3PublicEndpoint: getEnvOptional(
+      'STORAGE_S3_ENDPOINT_PUBLIC',
+      getEnvOptional('STORAGE_S3_ENDPOINT', 'http://localhost:9000')
+    ),
+    storageS3Region: getEnvOptional('STORAGE_S3_REGION', 'us-east-1'),
+    storageS3AccessKey: getEnvOptional('STORAGE_S3_ACCESS_KEY', 'superbased'),
+    storageS3SecretKey: getEnvOptional('STORAGE_S3_SECRET_KEY', 'superbased-secret'),
+    storageS3Bucket: getEnvOptional('STORAGE_S3_BUCKET', 'superbased-storage'),
+    storageS3ForcePathStyle: getEnvOptional('STORAGE_S3_FORCE_PATH_STYLE', 'true') === 'true',
+    storagePresignUploadTtlSeconds: parseInt(getEnvOptional('STORAGE_PRESIGN_UPLOAD_TTL_SECONDS', '900'), 10),
+    storagePresignDownloadTtlSeconds: parseInt(getEnvOptional('STORAGE_PRESIGN_DOWNLOAD_TTL_SECONDS', '900'), 10),
+    storageDefaultTtlSeconds: parseInt(getEnvOptional('STORAGE_DEFAULT_TTL_SECONDS', '2592000'), 10),
+    storageDeletedRetentionSeconds: parseInt(getEnvOptional('STORAGE_DELETED_RETENTION_SECONDS', '86400'), 10),
+    storageMaxObjectBytes: parseInt(getEnvOptional('STORAGE_MAX_OBJECT_BYTES', '104857600'), 10),
+    storageMaxBytesPerNpub: parseInt(getEnvOptional('STORAGE_MAX_BYTES_PER_NPUB', '1073741824'), 10),
   };
 }
 

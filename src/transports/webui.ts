@@ -86,7 +86,6 @@ export function renderConnectionUiHtml(): string {
     </section>
   </main>
 
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.4/build/qrcode.min.js"></script>
   <script>
     const qs = (id) => document.getElementById(id);
     const httpEl = qs('http');
@@ -96,6 +95,7 @@ export function renderConnectionUiHtml(): string {
     const tokenEl = qs('token');
     const statusEl = qs('status');
     const qrEl = qs('qr');
+    let qrApi = null;
 
     const origin = window.location.origin;
     qs('origin').textContent = origin;
@@ -106,12 +106,31 @@ export function renderConnectionUiHtml(): string {
       return JSON.parse(json);
     }
 
+    async function getQrApi() {
+      if (qrApi) return qrApi;
+      try {
+        const mod = await import('/ui/assets/qrcode.bundle.mjs');
+        qrApi = mod && (mod.default || mod);
+      } catch {
+        qrApi = null;
+      }
+      return qrApi;
+    }
+
     async function renderQr(value) {
       const text = (value || '').trim();
       const ctx = qrEl.getContext('2d');
       ctx.clearRect(0, 0, qrEl.width, qrEl.height);
-      if (!text || typeof QRCode === 'undefined') return;
-      await QRCode.toCanvas(qrEl, text, {
+      if (!text) return;
+
+      const qr = await getQrApi();
+      if (!qr || typeof qr.toCanvas !== 'function') {
+        statusEl.className = '';
+        statusEl.textContent = 'QR unavailable (network/CSP). Connection key is still valid.';
+        return;
+      }
+
+      await qr.toCanvas(qrEl, text, {
         width: 220,
         margin: 1,
         color: { dark: '#0b1a2b', light: '#ffffff' },
@@ -134,7 +153,9 @@ export function renderConnectionUiHtml(): string {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        const data = await res.json();
+        const raw = await res.text();
+        let data = {};
+        try { data = JSON.parse(raw); } catch {}
         if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
         tokenEl.value = data.token || '';
         await renderQr(tokenEl.value);
@@ -155,6 +176,379 @@ export function renderConnectionUiHtml(): string {
         qs('decoded').value = 'Invalid key: ' + String(err);
       }
     });
+  </script>
+</body>
+</html>`;
+}
+
+export function renderUiLoginHtml(): string {
+  const config = getConfig();
+  const admin = config.adminNpubs[0] || '(ADMIN_NPUBS not configured)';
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SuperBased Admin Login</title>
+  <style>
+    :root { --bg:#f6fbff; --ink:#0b1a2b; --card:#fff; --border:#d6e1ef; --accent:#0057ff; --sans:"Avenir Next","Segoe UI",sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:var(--sans); color:var(--ink); background:linear-gradient(160deg,var(--bg),#fff); padding:24px; }
+    main { max-width:760px; margin:0 auto; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:16px; }
+    button { border:0; border-radius:10px; padding:10px 14px; font-weight:700; color:#fff; background:var(--accent); cursor:pointer; }
+    code { word-break:break-all; }
+    #status { margin-top:12px; }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>Admin Report Login</h1>
+      <p>This page requires NIP-07 and an admin npub in <code>ADMIN_NPUBS</code>.</p>
+      <p>Allowed admin: <code>${escapeHtml(admin)}</code></p>
+      <button id="loginBtn" type="button">Login with NIP-07</button>
+      <div id="status"></div>
+    </section>
+  </main>
+  <script>
+    const statusEl = document.getElementById('status');
+    function setStatus(msg) { statusEl.textContent = msg; }
+
+    async function login() {
+      if (!window.nostr || typeof window.nostr.signEvent !== 'function') {
+        setStatus('NIP-07 extension not found.');
+        return;
+      }
+      try {
+        const url = window.location.origin + '/ui/auth/login';
+        const event = await window.nostr.signEvent({
+          kind: 27235,
+          created_at: Math.floor(Date.now() / 1000),
+          tags: [['u', url], ['method', 'POST']],
+          content: '',
+        });
+
+        const auth = 'Nostr ' + btoa(JSON.stringify(event));
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { Authorization: auth },
+          credentials: 'include',
+        });
+        const raw = await res.text();
+        let data = {};
+        try { data = JSON.parse(raw); } catch {}
+        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+        window.location.href = '/ui';
+      } catch (err) {
+        setStatus(String(err));
+      }
+    }
+
+    document.getElementById('loginBtn').addEventListener('click', login);
+  </script>
+</body>
+</html>`;
+}
+
+export function renderUsageReportUiHtml(): string {
+  const config = getConfig();
+  const relayJson = JSON.stringify(config.nostrRelays);
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SuperBased Retained Usage Report</title>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dexie@4/dist/dexie.min.js"></script>
+  <style>
+    :root { --bg:#f6fbff; --ink:#0b1a2b; --card:#fff; --border:#d6e1ef; --accent:#0057ff; --muted:#5a6f88; --sans:"Avenir Next","Segoe UI",sans-serif; --mono:"SFMono-Regular",Menlo,Consolas,monospace; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:var(--sans); color:var(--ink); background:linear-gradient(160deg,var(--bg),#fff); padding:18px; }
+    .shell { max-width:1200px; margin:0 auto; display:grid; gap:12px; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px; }
+    .row { display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
+    h1 { margin:0; }
+    button { border:0; border-radius:10px; padding:9px 12px; font-weight:700; color:#fff; background:var(--accent); cursor:pointer; }
+    table { width:100%; border-collapse:collapse; font-size:0.9rem; }
+    th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--border); vertical-align:top; }
+    th { color:var(--muted); font-weight:700; }
+    .mono { font-family:var(--mono); }
+    .user-cell { display:flex; gap:8px; align-items:flex-start; }
+    .avatar { width:30px; height:30px; border-radius:999px; object-fit:cover; border:1px solid var(--border); background:#e9f1fc; }
+    .meta-line { color:var(--muted); font-size:0.8rem; }
+    pre { margin:4px 0 0; white-space:pre-wrap; word-break:break-word; font-size:0.75rem; max-width:420px; }
+  </style>
+</head>
+<body x-data="usageReportApp()" x-init="init()">
+  <main class="shell">
+    <section class="card row">
+      <div>
+        <h1>Retained Storage by Pubkey</h1>
+        <div x-text="metaText"></div>
+      </div>
+      <div class="row">
+        <button type="button" @click="refresh()">Refresh</button>
+        <button type="button" @click="goConnect()">Connection Tools</button>
+        <button type="button" @click="logout()">Logout</button>
+      </div>
+    </section>
+    <section class="card">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>User</th>
+            <th>Pubkey</th>
+            <th>Retained</th>
+            <th>Rows</th>
+            <th>Live</th>
+            <th>Encrypted</th>
+            <th>Delegate</th>
+          </tr>
+        </thead>
+        <tbody>
+          <template x-for="(r, idx) in rows" :key="r.user_pubkey">
+            <tr>
+              <td class="mono" x-text="idx + 1"></td>
+              <td>
+                <div class="user-cell">
+                  <img class="avatar" :src="profileFor(r.user_pubkey).picture || ''" alt="" x-show="profileFor(r.user_pubkey).picture" />
+                  <div>
+                    <div x-text="profileName(r.user_pubkey)"></div>
+                    <div class="meta-line" x-text="profileFor(r.user_pubkey).nip05 || ''"></div>
+                    <details>
+                      <summary>kind0</summary>
+                      <pre x-text="profileJson(r.user_pubkey)"></pre>
+                    </details>
+                  </div>
+                </div>
+              </td>
+              <td class="mono" x-text="r.user_pubkey"></td>
+              <td class="mono" x-text="fmtBytes(r.retained_bytes)"></td>
+              <td class="mono" x-text="num(r.retained_rows)"></td>
+              <td class="mono" x-text="num(r.live_records)"></td>
+              <td class="mono" x-text="fmtBytes(r.encrypted_data_bytes)"></td>
+              <td class="mono" x-text="fmtBytes(r.delegate_payload_bytes)"></td>
+            </tr>
+          </template>
+        </tbody>
+      </table>
+    </section>
+  </main>
+  <script>
+    const RELAYS = ${relayJson};
+    const PROFILE_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+    const PROFILE_FETCH_COOLDOWN_MS = 15 * 60 * 1000;
+    const PROFILE_FETCH_WORKERS = 4;
+
+    function usageReportApp() {
+      return {
+        rows: [],
+        profiles: {},
+        metaText: 'Loading...',
+        db: null,
+        inflight: new Map(),
+
+        async init() {
+          this.db = new Dexie('superbased_admin_ui');
+          this.db.version(1).stores({
+            kind0_profiles: 'pubkey, fetched_at',
+          });
+          await this.refresh();
+        },
+
+        fmtBytes(v) {
+          const n = Number(v || 0);
+          if (!Number.isFinite(n) || n <= 0) return '0 B';
+          const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+          let x = n;
+          let i = 0;
+          while (x >= 1024 && i < units.length - 1) { x /= 1024; i += 1; }
+          return x.toFixed(i === 0 ? 0 : 2) + ' ' + units[i];
+        },
+
+        num(v) {
+          return Number(v || 0).toLocaleString();
+        },
+
+        profileFor(pubkey) {
+          return this.profiles[pubkey] || {};
+        },
+
+        profileName(pubkey) {
+          const p = this.profileFor(pubkey);
+          return p.display_name || p.name || p.nip05 || pubkey.slice(0, 12) + '...';
+        },
+
+        profileJson(pubkey) {
+          const p = this.profileFor(pubkey);
+          if (!p || !p.raw_kind0) return '{}';
+          return JSON.stringify(p.raw_kind0, null, 2);
+        },
+
+        async refresh() {
+          const data = await this.loadReport();
+          this.rows = data.rows || [];
+          this.metaText = 'Snapshot hour: ' + (data.captured_hour || '-') + ' | Users: ' + this.rows.length;
+          await this.hydrateProfiles();
+        },
+
+        async loadReport() {
+          const res = await fetch('/ui/report', { credentials: 'include' });
+          if (res.status === 401) {
+            window.location.href = '/ui';
+            return { rows: [] };
+          }
+          const raw = await res.text();
+          let data = {};
+          try { data = JSON.parse(raw); } catch {}
+          if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+          return data;
+        },
+
+        async hydrateProfiles() {
+          const pubkeys = Array.from(new Set(this.rows.map((r) => r.user_pubkey).filter(Boolean)));
+          if (pubkeys.length === 0) return;
+
+          const now = Date.now();
+          const cachedRows = await this.db.kind0_profiles.where('pubkey').anyOf(pubkeys).toArray();
+          const cachedByPubkey = new Map(cachedRows.map((r) => [r.pubkey, r]));
+          const toRefresh = [];
+
+          for (const pubkey of pubkeys) {
+            const cached = cachedByPubkey.get(pubkey);
+            if (cached) {
+              this.profiles[pubkey] = cached;
+            }
+
+            const fetchedAt = Number(cached?.fetched_at || 0);
+            const lastAttemptAt = Number(cached?.last_attempt_at || fetchedAt || now);
+            const cacheFresh = fetchedAt > 0 && (now - fetchedAt) < PROFILE_CACHE_TTL_MS;
+            const cooldownActive = (now - lastAttemptAt) < PROFILE_FETCH_COOLDOWN_MS;
+
+            if (!cacheFresh && !cooldownActive) {
+              toRefresh.push(pubkey);
+            }
+          }
+
+          if (toRefresh.length === 0) return;
+
+          let idx = 0;
+          const worker = async () => {
+            while (idx < toRefresh.length) {
+              const myIdx = idx++;
+              const pubkey = toRefresh[myIdx];
+              await this.refreshSingleProfile(pubkey, now);
+            }
+          };
+
+          const workers = Array.from({ length: Math.min(PROFILE_FETCH_WORKERS, toRefresh.length) }, () => worker());
+          await Promise.all(workers);
+        },
+
+        async refreshSingleProfile(pubkey, nowTs) {
+          const now = nowTs || Date.now();
+          if (this.inflight.has(pubkey)) return this.inflight.get(pubkey);
+
+          const run = (async () => {
+            await this.db.kind0_profiles.put({
+              pubkey,
+              ...this.profileFor(pubkey),
+              last_attempt_at: now,
+            });
+
+            const fresh = await this.fetchKind0(pubkey);
+            if (!fresh) return;
+
+            const record = {
+              pubkey,
+              name: fresh.name || '',
+              display_name: fresh.display_name || '',
+              about: fresh.about || '',
+              picture: fresh.picture || '',
+              nip05: fresh.nip05 || '',
+              banner: fresh.banner || '',
+              website: fresh.website || '',
+              lud16: fresh.lud16 || '',
+              raw_kind0: fresh,
+              fetched_at: now,
+              last_attempt_at: now,
+            };
+            this.profiles[pubkey] = record;
+            await this.db.kind0_profiles.put(record);
+          })();
+
+          this.inflight.set(pubkey, run);
+          try {
+            await run;
+          } finally {
+            this.inflight.delete(pubkey);
+          }
+        },
+
+        async fetchKind0(pubkey) {
+          const attempts = RELAYS.map((relayUrl) => this.fetchKind0FromRelay(relayUrl, pubkey));
+          const results = await Promise.all(attempts);
+          for (const profile of results) {
+            if (profile) return profile;
+          }
+          return null;
+        },
+
+        async fetchKind0FromRelay(relayUrl, pubkey) {
+          return await new Promise((resolve) => {
+            let settled = false;
+            let ws;
+            try {
+              ws = new WebSocket(relayUrl);
+            } catch {
+              resolve(null);
+              return;
+            }
+            const sub = 'k0-' + Math.random().toString(36).slice(2);
+            const timeout = setTimeout(() => done(null), 3000);
+
+            function done(value) {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timeout);
+              try { ws.close(); } catch {}
+              resolve(value);
+            }
+
+            ws.onopen = () => {
+              ws.send(JSON.stringify(['REQ', sub, { kinds: [0], authors: [pubkey], limit: 1 }]));
+            };
+            ws.onmessage = (ev) => {
+              try {
+                const msg = JSON.parse(ev.data);
+                if (!Array.isArray(msg)) return;
+                if (msg[0] === 'EVENT' && msg[2] && typeof msg[2].content === 'string') {
+                  const content = JSON.parse(msg[2].content || '{}');
+                  done(content);
+                } else if (msg[0] === 'EOSE') {
+                  done(null);
+                }
+              } catch {}
+            };
+            ws.onerror = () => done(null);
+          });
+        },
+
+        async logout() {
+          await fetch('/ui/auth/logout', { method: 'POST', credentials: 'include' });
+          window.location.href = '/ui';
+        },
+
+        goConnect() {
+          window.location.href = '/ui/connect';
+        },
+      };
+    }
   </script>
 </body>
 </html>`;

@@ -11,9 +11,12 @@
     "init": "bun run src/cli/init-db.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test src/__tests__/",
-    "prune": "bun run src/cli/prune-records.ts"
+    "prune": "bun run src/cli/prune-records.ts",
+    "prune:storage": "bun run src/cli/prune-storage.ts"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.883.0",
+    "@aws-sdk/s3-request-presigner": "^3.883.0",
     "@contextvm/sdk": "0.2.10",
     "@modelcontextprotocol/sdk": "^1.11.0",
     "@noble/hashes": "^1.7.1",

@@ -220,3 +220,48 @@ export interface PushSubscriptionUpsertInput {
 export interface PushSubscriptionDeleteInput {
   endpoint: string;
 }
+
+// ==================== STORAGE TYPES ====================
+
+export interface StoragePrepareUploadInput {
+  filename: string;
+  mime_type: string;
+  size_bytes: number;
+  ttl_seconds?: number;
+}
+
+export interface StoragePrepareUploadResult {
+  object_id: string;
+  object_key: string;
+  bucket: string;
+  upload_url: string;
+  expires_at: string | null;
+}
+
+export interface StorageCompleteUploadInput {
+  object_id: string;
+}
+
+export interface StorageObjectOutput {
+  id: string;
+  app_pubkey: string;
+  owner_pubkey: string;
+  bucket: string;
+  object_key: string;
+  file_name: string;
+  mime_type: string;
+  size_bytes: number;
+  status: 'pending' | 'ready' | 'deleted';
+  created_at: string;
+  completed_at?: string | null;
+  expires_at?: string | null;
+  deleted_at?: string | null;
+}
+
+export interface StorageUsageResult {
+  owner_pubkey: string;
+  file_count: number;
+  used_bytes: number;
+  max_bytes: number;
+  available_bytes: number;
+}

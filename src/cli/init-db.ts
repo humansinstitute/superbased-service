@@ -109,6 +109,45 @@ async function main() {
   `;
   console.log('  done');
 
+  // ── superbased_retained_usage_hourly ──
+  console.log('Creating superbased_retained_usage_hourly...');
+  await sql`
+    CREATE TABLE IF NOT EXISTS superbased_retained_usage_hourly (
+      captured_hour          timestamptz NOT NULL,
+      user_pubkey            text NOT NULL,
+      live_records           integer NOT NULL,
+      retained_rows          integer NOT NULL,
+      retained_bytes         bigint NOT NULL,
+      encrypted_data_bytes   bigint NOT NULL,
+      delegate_payload_bytes bigint NOT NULL,
+      created_at             timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (captured_hour, user_pubkey)
+    )
+  `;
+  console.log('  done');
+
+  // ── superbased_storage_objects ──
+  console.log('Creating superbased_storage_objects...');
+  await sql`
+    CREATE TABLE IF NOT EXISTS superbased_storage_objects (
+      id              uuid PRIMARY KEY,
+      app_pubkey      text NOT NULL,
+      owner_pubkey    text NOT NULL,
+      bucket          text NOT NULL,
+      object_key      text NOT NULL,
+      file_name       text NOT NULL,
+      mime_type       text NOT NULL,
+      size_bytes      bigint NOT NULL CHECK (size_bytes > 0),
+      status          text NOT NULL CHECK (status IN ('pending', 'ready', 'deleted')),
+      created_at      timestamptz NOT NULL DEFAULT now(),
+      updated_at      timestamptz NOT NULL DEFAULT now(),
+      completed_at    timestamptz,
+      expires_at      timestamptz,
+      deleted_at      timestamptz
+    )
+  `;
+  console.log('  done');
+
   // ── Indexes ──
   console.log('\nCreating indexes...');
 
@@ -147,6 +186,31 @@ async function main() {
   await sql`
     CREATE INDEX IF NOT EXISTS idx_push_owner_app
       ON superbased_push_subscriptions (app_pubkey, owner_pubkey)
+  `;
+
+  console.log('  idx_retained_usage_latest...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_retained_usage_latest
+      ON superbased_retained_usage_hourly (captured_hour DESC, retained_bytes DESC)
+  `;
+
+  console.log('  uq_storage_object_key...');
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_storage_object_key
+      ON superbased_storage_objects (bucket, object_key)
+  `;
+
+  console.log('  idx_storage_owner_app...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_storage_owner_app
+      ON superbased_storage_objects (app_pubkey, owner_pubkey, status, created_at DESC)
+  `;
+
+  console.log('  idx_storage_expires...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_storage_expires
+      ON superbased_storage_objects (expires_at)
+      WHERE expires_at IS NOT NULL
   `;
 
   console.log('  done');

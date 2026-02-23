@@ -13,6 +13,7 @@ import { getConfig } from './config';
 import { startHttpServer } from './transports/http';
 import { startCvmTransport } from './transports/cvm';
 import { nip19 } from 'nostr-tools';
+import { usageReportService } from './services/usage-report';
 
 async function main() {
   console.log('');
@@ -43,6 +44,11 @@ async function main() {
   console.log(`  ✓ HTTP server running on http://${config.httpHost}:${config.httpPort}`);
   console.log('');
 
+  // Start hourly retained-size snapshots
+  usageReportService.startScheduler();
+  console.log('  ✓ Hourly retained usage snapshots enabled');
+  console.log('');
+
   // Start CVM transport
   console.log('Starting CVM transport...');
   await startCvmTransport();
@@ -68,10 +74,12 @@ async function main() {
   console.log(`    DELETE /db/:table          - Delete records`);
   console.log('');
   console.log('  Storage:');
-  console.log(`    POST /storage/:bucket/*    - Upload file`);
-  console.log(`    GET  /storage/:bucket/*    - Download file`);
-  console.log(`    GET  /storage/:bucket      - List files`);
-  console.log(`    DELETE /storage/:bucket/*  - Delete file`);
+  console.log(`    POST /storage/prepare-upload         - Get presigned upload URL`);
+  console.log(`    POST /storage/complete-upload        - Finalize uploaded object`);
+  console.log(`    GET  /storage/list                   - List own objects`);
+  console.log(`    GET  /storage/usage                  - Usage/quota for caller`);
+  console.log(`    GET  /storage/:objectId/download-url - Get presigned download URL`);
+  console.log(`    DELETE /storage/:objectId            - Delete object`);
   console.log('');
   console.log('  Functions:');
   console.log(`    POST /functions/:name      - Invoke edge function`);
@@ -81,7 +89,8 @@ async function main() {
   console.log('');
   console.log('  Health:');
   console.log(`    GET  /health               - Service health (no auth)`);
-  console.log(`    GET  /ui                   - Built-in key/token web UI`);
+  console.log(`    GET  /ui                   - Admin retained usage report (NIP-07 login)`);
+  console.log(`    GET  /ui/connect           - Built-in key/token web UI`);
   console.log('');
   console.log('═══════════════════════════════════════════════════════════');
   console.log('');
