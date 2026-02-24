@@ -4,6 +4,7 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getDb } from '../db/postgres';
 import { getConfig } from '../config';
+import { delegationsService } from './delegations';
 import type {
   AuthContext,
   StoragePrepareUploadInput,
@@ -192,7 +193,6 @@ class StorageService {
       SELECT * FROM ${sql(TABLE)}
       WHERE id = ${objectId}
         AND app_pubkey = ${appPubkey}
-        AND owner_pubkey = ${auth.pubkey}
         AND status = 'ready'
         AND deleted_at IS NULL
         AND (expires_at IS NULL OR expires_at > now())
@@ -201,6 +201,18 @@ class StorageService {
 
     if (rows.length === 0) throw new Error('object_not_found');
     const row = rows[0] as any;
+    const ownerPubkey = row.owner_pubkey as string;
+
+    if (auth.pubkey !== ownerPubkey) {
+      const hasReadDelegation = await delegationsService.checkReadPermission(
+        appPubkey,
+        auth.pubkey,
+        ownerPubkey
+      );
+      if (!hasReadDelegation) {
+        throw new Error('object_not_found');
+      }
+    }
 
     const command = new GetObjectCommand({
       Bucket: row.bucket,
