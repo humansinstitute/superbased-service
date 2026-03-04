@@ -836,7 +836,6 @@ export function createHttpServer() {
       const result = await recordsService.fetchDelegatedRecords(appPubkey, auth.pubkey, collection, owner, limit, cursor);
       return c.json(result);
     } catch (err) {
-      console.error(`[delegated] collection=${collection} error:`, err);
       return c.json({ error: String(err) }, 500);
     }
   });
