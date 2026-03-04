@@ -15,6 +15,18 @@ import type {
 
 const TABLE = 'superbased_records_v3';
 
+/** Safely serialize a Postgres timestamp to ISO string, returning null for invalid dates */
+function safeISODate(val: unknown): string | null {
+  if (val instanceof Date) {
+    return isNaN(val.getTime()) ? null : val.toISOString();
+  }
+  if (typeof val === 'string') {
+    const d = new Date(val);
+    return isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  return null;
+}
+
 /**
  * Service for v3 append-only versioned encrypted records
  */
@@ -196,7 +208,7 @@ export class RecordsService {
         collection: r.collection,
         encrypted_data: r.encrypted_data,
         encrypted_from: r.encrypted_from,
-        created_at: r.created_at,
+        created_at: safeISODate(r.created_at),
       };
       if (r.delegate_payloads && Object.keys(r.delegate_payloads).length > 0) {
         out.delegate_payloads = r.delegate_payloads;
@@ -212,7 +224,7 @@ export class RecordsService {
     if (limit) {
       result.has_more = hasMore;
       if (hasMore && records.length > 0) {
-        result.cursor = records[records.length - 1].created_at;
+        result.cursor = records[records.length - 1].created_at ?? undefined;
       }
     }
 
@@ -257,7 +269,7 @@ export class RecordsService {
       owner_pubkey: r.user_pubkey,
       encrypted_from: r.encrypted_from,
       delegate_payload: r.delegate_payloads[delegatePubkey],
-      created_at: r.created_at,
+      created_at: safeISODate(r.created_at),
     }));
 
     // If we fetched limit+1 and got that many, there are more pages
@@ -268,7 +280,7 @@ export class RecordsService {
     if (limit) {
       result.has_more = hasMore;
       if (hasMore && records.length > 0) {
-        result.cursor = records[records.length - 1].created_at;
+        result.cursor = records[records.length - 1].created_at ?? undefined;
       }
     }
 
@@ -302,7 +314,7 @@ export class RecordsService {
         version: r.version,
         record_state: r.record_state,
         encrypted_from: r.encrypted_from,
-        created_at: r.created_at,
+        created_at: safeISODate(r.created_at),
       };
       if (includeData) {
         v.encrypted_data = r.encrypted_data;

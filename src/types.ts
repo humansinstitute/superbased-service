@@ -90,7 +90,7 @@ export interface RecordOutputV3 {
   encrypted_data: string;
   encrypted_from: string;
   delegate_payloads?: Record<string, string>;
-  created_at: string;
+  created_at: string | null;
 }
 
 // Result from fetch
@@ -106,7 +106,7 @@ export interface DelegatedRecordOutputV3 {
   owner_pubkey: string;
   encrypted_from: string;
   delegate_payload: string;
-  created_at: string;
+  created_at: string | null;
 }
 
 // Result from delegated fetch
@@ -119,7 +119,7 @@ export interface HistoryVersionV3 {
   version: number;
   record_state: string;
   encrypted_from: string;
-  created_at: string;
+  created_at: string | null;
   encrypted_data?: string;
   delegate_payloads?: Record<string, string>;
 }
