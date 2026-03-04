@@ -26,6 +26,16 @@ export function getDb(): postgres.Sql {
       max: 10,
       idle_timeout: 20,
       connect_timeout: 10,
+      types: {
+        // Return timestamps as raw strings instead of Date objects
+        // to prevent RangeError on invalid/out-of-range dates in the DB
+        date: {
+          to: 1184,
+          from: [1082, 1083, 1114, 1184],
+          serialize: (x: string | Date) => (x instanceof Date ? x.toISOString() : x),
+          parse: (x: string) => x,
+        },
+      },
     });
   }
   return sql;
