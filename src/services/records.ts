@@ -189,14 +189,14 @@ export class RecordsService {
 
     const rows = await sql`
       SELECT record_id, version, collection, encrypted_data, encrypted_from,
-             delegate_payloads, created_at
+             delegate_payloads, created_at::text as created_at
       FROM ${sql(TABLE)}
       WHERE app_pubkey = ${appPubkey}
         AND user_pubkey = ${auth.pubkey}
         AND record_state = 'live'
         ${collection ? sql`AND collection = ${collection}` : sql``}
-        ${since ? sql`AND created_at > ${since}` : sql``}
-        ${cursor ? sql`AND created_at < ${cursor}` : sql``}
+        ${since ? sql`AND created_at > ${since}::timestamptz` : sql``}
+        ${cursor ? sql`AND created_at < ${cursor}::timestamptz` : sql``}
       ORDER BY created_at DESC
       ${fetchLimit ? sql`LIMIT ${fetchLimit}` : sql``}
     `;
@@ -250,14 +250,14 @@ export class RecordsService {
 
     const rows = await sql`
       SELECT record_id, version, collection, user_pubkey, encrypted_from,
-             delegate_payloads, created_at
+             delegate_payloads, created_at::text as created_at
       FROM ${sql(TABLE)}
       WHERE app_pubkey = ${appPubkey}
         AND record_state = 'live'
         AND delegate_payloads ? ${delegatePubkey}
         ${collection ? sql`AND collection = ${collection}` : sql``}
         ${ownerPubkey ? sql`AND user_pubkey = ${ownerPubkey}` : sql``}
-        ${cursor ? sql`AND created_at < ${cursor}` : sql``}
+        ${cursor ? sql`AND created_at < ${cursor}::timestamptz` : sql``}
       ORDER BY created_at DESC
       ${fetchLimit ? sql`LIMIT ${fetchLimit}` : sql``}
     `;
@@ -298,7 +298,7 @@ export class RecordsService {
     const sql = getDb();
 
     const rows = await sql`
-      SELECT version, record_state, encrypted_from, created_at,
+      SELECT version, record_state, encrypted_from, created_at::text as created_at,
              user_pubkey
              ${includeData ? sql`, encrypted_data, delegate_payloads` : sql``}
       FROM ${sql(TABLE)}
