@@ -9,16 +9,21 @@ import { appsService } from '../services/apps';
 import { recordsService } from '../services/records';
 import { usersService } from '../services/users';
 import { delegationsService } from '../services/delegations';
+import { groupsService } from '../services/groups';
 import { pushService } from '../services/push';
 import { usageReportService } from '../services/usage-report';
 import { storageService } from '../services/storage';
 import { renderConnectionUiHtml, renderUiLoginHtml, renderUsageReportUiHtml } from './webui';
 import type {
   AuthContext,
+  AddGroupMemberInput,
+  CreateGroupInput,
+  CreateGroupRequestInput,
   SyncRecordInputV3,
   CreateDelegationInput,
   PushSubscriptionUpsertInput,
   PushSubscriptionDeleteInput,
+  ResolveGroupRequestInput,
   StoragePrepareUploadInput,
   StorageCompleteUploadInput,
 } from '../types';
@@ -694,6 +699,383 @@ export function createHttpServer() {
       } else {
         return c.json({ error: 'Delegation not found or already revoked' }, 404);
       }
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // ==================== Group Routes ====================
+
+  // Create group in default namespace (app-less mode)
+  app.post('/groups', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: CreateGroupInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const group = await groupsService.createGroup(appPubkey, auth, input);
+      return c.json({ group }, 201);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // List groups where caller is a current member/delegate
+  app.get('/groups', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const groups = await groupsService.listMyGroups(appPubkey, auth);
+      return c.json({ groups });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/groups/:groupId/members', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const groupId = c.req.param('groupId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const members = await groupsService.listGroupMembers(appPubkey, auth, groupId);
+      return c.json({ members });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.post('/groups/:groupId/members', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const groupId = c.req.param('groupId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: AddGroupMemberInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const result = await groupsService.addMember(appPubkey, auth, groupId, input);
+      return c.json(result, result.created ? 201 : 200);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.delete('/groups/:groupId/members/:memberNpub', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const groupId = c.req.param('groupId');
+    const memberNpub = c.req.param('memberNpub');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const removed = await groupsService.removeMember(appPubkey, auth, groupId, memberNpub);
+      if (!removed) return c.json({ error: 'Member not found or cannot be removed' }, 404);
+      return c.json({ success: true });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.post('/groups/:groupId/requests', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const groupId = c.req.param('groupId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: CreateGroupRequestInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const result = await groupsService.createJoinRequest(appPubkey, auth, groupId, input);
+      return c.json(result, result.created ? 201 : 200);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.get('/groups/:groupId/requests', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const groupId = c.req.param('groupId');
+    const { status } = c.req.query();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const requests = await groupsService.listJoinRequests(appPubkey, auth, groupId, status);
+      return c.json({ requests });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.patch('/groups/:groupId/requests/:requestId', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const groupId = c.req.param('groupId');
+    const requestId = c.req.param('requestId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: ResolveGroupRequestInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const result = await groupsService.resolveJoinRequest(appPubkey, auth, groupId, requestId, input);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // Create group in app namespace
+  app.post('/apps/:appNpub/groups', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    let input: CreateGroupInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const group = await groupsService.createGroup(appPubkey, auth, input);
+      return c.json({ group }, 201);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.get('/apps/:appNpub/groups', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    try {
+      const groups = await groupsService.listMyGroups(appPubkey, auth);
+      return c.json({ groups });
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.get('/apps/:appNpub/groups/:groupId/members', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const groupId = c.req.param('groupId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    try {
+      const members = await groupsService.listGroupMembers(appPubkey, auth, groupId);
+      return c.json({ members });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.post('/apps/:appNpub/groups/:groupId/members', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const groupId = c.req.param('groupId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    let input: AddGroupMemberInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const result = await groupsService.addMember(appPubkey, auth, groupId, input);
+      return c.json(result, result.created ? 201 : 200);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.delete('/apps/:appNpub/groups/:groupId/members/:memberNpub', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const groupId = c.req.param('groupId');
+    const memberNpub = c.req.param('memberNpub');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    try {
+      const removed = await groupsService.removeMember(appPubkey, auth, groupId, memberNpub);
+      if (!removed) return c.json({ error: 'Member not found or cannot be removed' }, 404);
+      return c.json({ success: true });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.post('/apps/:appNpub/groups/:groupId/requests', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const groupId = c.req.param('groupId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    let input: CreateGroupRequestInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const result = await groupsService.createJoinRequest(appPubkey, auth, groupId, input);
+      return c.json(result, result.created ? 201 : 200);
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.get('/apps/:appNpub/groups/:groupId/requests', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const groupId = c.req.param('groupId');
+    const { status } = c.req.query();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    try {
+      const requests = await groupsService.listJoinRequests(appPubkey, auth, groupId, status);
+      return c.json({ requests });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  app.patch('/apps/:appNpub/groups/:groupId/requests/:requestId', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const groupId = c.req.param('groupId');
+    const requestId = c.req.param('requestId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    let input: ResolveGroupRequestInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    try {
+      const result = await groupsService.resolveJoinRequest(appPubkey, auth, groupId, requestId, input);
+      return c.json(result);
     } catch (err) {
       return c.json({ error: String(err) }, 400);
     }

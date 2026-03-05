@@ -200,6 +200,71 @@ export interface WritePermissionResult {
   reason?: string;
 }
 
+// ==================== GROUP TYPES ====================
+
+export type GroupRole = 'owner' | 'admin' | 'member' | 'pending';
+export type GroupRequestStatus = 'pending' | 'approved' | 'rejected' | 'expired';
+
+export interface GroupMember {
+  id: string;
+  app_pubkey: string;
+  group_id: string;
+  group_name: string;
+  group_pubkey: string;
+  owner_pubkey: string;
+  member_pubkey: string;
+  encrypted_group_key: string;
+  role: GroupRole;
+  invited_by?: string | null;
+  joined_at?: string | null;
+  created_at: string;
+  updated_at?: string;
+  revoked_at?: string | null;
+}
+
+export interface GroupSummary {
+  group_id: string;
+  group_name: string;
+  group_pubkey: string;
+  owner_pubkey: string;
+  my_role: GroupRole;
+  joined_at?: string | null;
+}
+
+export interface GroupRequest {
+  id: string;
+  app_pubkey: string;
+  group_id: string;
+  requester_pubkey: string;
+  invite_secret: string;
+  status: GroupRequestStatus;
+  created_at: string;
+  updated_at: string;
+  resolved_at?: string | null;
+}
+
+export interface CreateGroupInput {
+  group_name: string;
+  group_pubkey: string;
+  encrypted_group_key: string;
+}
+
+export interface AddGroupMemberInput {
+  member_npub: string;
+  encrypted_group_key: string;
+  role?: Exclude<GroupRole, 'owner'>;
+}
+
+export interface CreateGroupRequestInput {
+  invite_secret: string;
+}
+
+export interface ResolveGroupRequestInput {
+  status: Exclude<GroupRequestStatus, 'pending'>;
+  member_encrypted_group_key?: string;
+  role?: Exclude<GroupRole, 'owner'>;
+}
+
 // ==================== PUSH TYPES ====================
 
 export interface PushSubscriptionInput {

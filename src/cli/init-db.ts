@@ -69,6 +69,45 @@ async function main() {
   `;
   console.log('  done');
 
+  // ── superbased_group_members ──
+  console.log('Creating superbased_group_members...');
+  await sql`
+    CREATE TABLE IF NOT EXISTS superbased_group_members (
+      id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      app_pubkey          text NOT NULL,
+      group_id            uuid NOT NULL,
+      group_name          text NOT NULL,
+      group_pubkey        text NOT NULL,
+      owner_pubkey        text NOT NULL,
+      member_pubkey       text NOT NULL,
+      encrypted_group_key text NOT NULL,
+      role                text NOT NULL CHECK (role IN ('owner', 'admin', 'member', 'pending')),
+      invited_by          text,
+      joined_at           timestamptz,
+      created_at          timestamptz NOT NULL DEFAULT now(),
+      updated_at          timestamptz NOT NULL DEFAULT now(),
+      revoked_at          timestamptz
+    )
+  `;
+  console.log('  done');
+
+  // ── superbased_group_requests ──
+  console.log('Creating superbased_group_requests...');
+  await sql`
+    CREATE TABLE IF NOT EXISTS superbased_group_requests (
+      id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      app_pubkey      text NOT NULL,
+      group_id        uuid NOT NULL,
+      requester_pubkey text NOT NULL,
+      invite_secret   text NOT NULL,
+      status          text NOT NULL CHECK (status IN ('pending', 'approved', 'rejected', 'expired')),
+      created_at      timestamptz NOT NULL DEFAULT now(),
+      updated_at      timestamptz NOT NULL DEFAULT now(),
+      resolved_at     timestamptz
+    )
+  `;
+  console.log('  done');
+
   // ── superbased_records_v3 ──
   console.log('Creating superbased_records_v3...');
   await sql`
@@ -174,6 +213,50 @@ async function main() {
   await sql`
     CREATE INDEX IF NOT EXISTS idx_records_v3_delegates
       ON superbased_records_v3 USING GIN (delegate_payloads)
+  `;
+
+  console.log('  uq_group_members_active...');
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_group_members_active
+      ON superbased_group_members (app_pubkey, group_id, member_pubkey)
+      WHERE revoked_at IS NULL
+  `;
+
+  console.log('  idx_group_members_member_lookup...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_group_members_member_lookup
+      ON superbased_group_members (app_pubkey, member_pubkey, revoked_at)
+  `;
+
+  console.log('  idx_group_members_group_lookup...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_group_members_group_lookup
+      ON superbased_group_members (app_pubkey, group_id, revoked_at)
+  `;
+
+  console.log('  idx_group_members_delegate_lookup...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_group_members_delegate_lookup
+      ON superbased_group_members (app_pubkey, group_pubkey, revoked_at)
+  `;
+
+  console.log('  uq_group_requests_pending...');
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_group_requests_pending
+      ON superbased_group_requests (app_pubkey, group_id, requester_pubkey)
+      WHERE status = 'pending'
+  `;
+
+  console.log('  idx_group_requests_group_status...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_group_requests_group_status
+      ON superbased_group_requests (app_pubkey, group_id, status, created_at DESC)
+  `;
+
+  console.log('  idx_group_requests_requester_status...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_group_requests_requester_status
+      ON superbased_group_requests (app_pubkey, requester_pubkey, status, created_at DESC)
   `;
 
   console.log('  uq_push_subscription_endpoint...');
