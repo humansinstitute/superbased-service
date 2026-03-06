@@ -35,6 +35,10 @@ interface UiSessionPayload {
   exp: number;
 }
 
+const UI_TABLE_DEFAULT_LIMIT = 25;
+const UI_TABLE_MAX_LIMIT = 200;
+const UI_TABLE_NAME_PATTERN = /^superbased_[a-z0-9_]+$/;
+
 function b64url(input: string): string {
   return Buffer.from(input, 'utf8').toString('base64url');
 }
@@ -121,6 +125,47 @@ function safeNpubEncode(pubkey: string): string | null {
   }
 }
 
+function parsePositiveInt(value: string | undefined, fallback: number, max: number): number {
+  const parsed = Number.parseInt(value || '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.min(parsed, max);
+}
+
+function parseOffset(value: string | undefined): number {
+  const parsed = Number.parseInt(value || '', 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return parsed;
+}
+
+function normalizeUiTableName(value: string | undefined): string | null {
+  if (!value) return null;
+  const normalized = value.trim().toLowerCase();
+  if (!UI_TABLE_NAME_PATTERN.test(normalized)) return null;
+  return normalized;
+}
+
+function toJsonSafeValue(value: unknown): unknown {
+  if (typeof value === 'bigint') return value.toString();
+  if (value instanceof Date) return value.toISOString();
+  if (Array.isArray(value)) return value.map((entry) => toJsonSafeValue(entry));
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = toJsonSafeValue(entry);
+    }
+    return out;
+  }
+  return value;
+}
+
+function getUiAdminFromCookie(c: any, config: ReturnType<typeof getConfig>): AuthContext | null {
+  const token = parseCookieValue(c.req.header('Cookie'), 'sb_ui_session');
+  const session = verifyUiSessionToken(token, config);
+  if (!session) return null;
+  const auth = createAuthContext(session.pubkey);
+  return auth.isAdmin ? auth : null;
+}
+
 // Extend Hono context with auth
 declare module 'hono' {
   interface ContextVariableMap {
@@ -185,13 +230,8 @@ export function createHttpServer() {
 
   // Admin UI (NIP-07 login required for report access)
   app.get('/ui', async (c) => {
-    const token = parseCookieValue(c.req.header('Cookie'), 'sb_ui_session');
-    const session = verifyUiSessionToken(token, config);
-    if (!session) {
-      return c.html(renderUiLoginHtml());
-    }
-    const auth = createAuthContext(session.pubkey);
-    if (!auth.isAdmin) {
+    const auth = getUiAdminFromCookie(c, config);
+    if (!auth) {
       return c.html(renderUiLoginHtml());
     }
     return c.html(renderUsageReportUiHtml());
@@ -225,12 +265,8 @@ export function createHttpServer() {
 
   app.get('/ui/report', async (c) => {
     try {
-      const token = parseCookieValue(c.req.header('Cookie'), 'sb_ui_session');
-      const session = verifyUiSessionToken(token, config);
-      if (!session) return c.json({ error: 'Unauthorized' }, 401);
-
-      const auth = createAuthContext(session.pubkey);
-      if (!auth.isAdmin) return c.json({ error: 'Unauthorized' }, 401);
+      const auth = getUiAdminFromCookie(c, config);
+      if (!auth) return c.json({ error: 'Unauthorized' }, 401);
 
       const report = await usageReportService.getLatestReport(1000);
       const rows = report.rows.map((r) => ({
@@ -247,6 +283,97 @@ export function createHttpServer() {
       return c.json({ captured_hour: report.captured_hour, rows });
     } catch (err: any) {
       console.error('GET /ui/report failed:', err);
+      return c.json({ error: err?.message || String(err) }, 500);
+    }
+  });
+
+  app.get('/ui/tables', async (c) => {
+    try {
+      const auth = getUiAdminFromCookie(c, config);
+      if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+      const sql = getDb();
+      const tables = await sql`
+        SELECT tablename
+        FROM pg_tables
+        WHERE schemaname = 'public'
+          AND tablename ~ '^superbased_[a-z0-9_]+$'
+        ORDER BY tablename ASC
+      `;
+
+      return c.json({
+        tables: tables.map((row: any) => row.tablename),
+      });
+    } catch (err: any) {
+      console.error('GET /ui/tables failed:', err);
+      return c.json({ error: err?.message || String(err) }, 500);
+    }
+  });
+
+  app.get('/ui/tables/:table', async (c) => {
+    try {
+      const auth = getUiAdminFromCookie(c, config);
+      if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+      const tableName = normalizeUiTableName(c.req.param('table'));
+      if (!tableName) {
+        return c.json({ error: 'Invalid table name' }, 400);
+      }
+
+      const limit = parsePositiveInt(c.req.query('limit'), UI_TABLE_DEFAULT_LIMIT, UI_TABLE_MAX_LIMIT);
+      const offset = parseOffset(c.req.query('offset'));
+
+      const sql = getDb();
+      const existsRows = await sql`
+        SELECT 1
+        FROM pg_tables
+        WHERE schemaname = 'public'
+          AND tablename = ${tableName}
+        LIMIT 1
+      `;
+      if (existsRows.length === 0) {
+        return c.json({ error: `Table not found: ${tableName}` }, 404);
+      }
+
+      const columnRows = await sql`
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = ${tableName}
+        ORDER BY ordinal_position ASC
+      `;
+      const columns = columnRows.map((row: any) => String(row.column_name));
+      const preferredSortColumns = ['updated_at', 'created_at', 'captured_hour', 'resolved_at', 'joined_at', 'id'];
+      const orderByColumn = preferredSortColumns.find((name) => columns.includes(name)) || null;
+
+      const totalRows = await sql`SELECT COUNT(*)::bigint AS total FROM ${sql(tableName)}`;
+      const total = Number.parseInt(String(totalRows[0]?.total || '0'), 10) || 0;
+
+      const rows = orderByColumn
+        ? await sql`
+            SELECT *
+            FROM ${sql(tableName)}
+            ORDER BY ${sql(orderByColumn)} DESC
+            LIMIT ${limit}
+            OFFSET ${offset}
+          `
+        : await sql`
+            SELECT *
+            FROM ${sql(tableName)}
+            LIMIT ${limit}
+            OFFSET ${offset}
+          `;
+
+      return c.json({
+        table: tableName,
+        columns,
+        total,
+        limit,
+        offset,
+        rows: toJsonSafeValue(rows),
+      });
+    } catch (err: any) {
+      console.error('GET /ui/tables/:table failed:', err);
       return c.json({ error: err?.message || String(err) }, 500);
     }
   });

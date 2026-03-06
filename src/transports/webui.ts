@@ -271,8 +271,10 @@ export function renderUsageReportUiHtml(): string {
     .shell { max-width:1200px; margin:0 auto; display:grid; gap:12px; }
     .card { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:14px; }
     .row { display:flex; gap:8px; align-items:center; justify-content:space-between; flex-wrap:wrap; }
-    h1 { margin:0; }
+    h1, h2 { margin:0; }
     button { border:0; border-radius:10px; padding:9px 12px; font-weight:700; color:#fff; background:var(--accent); cursor:pointer; }
+    button:disabled { opacity:0.55; cursor:not-allowed; }
+    select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; font-family:var(--sans); min-width:240px; background:#fff; }
     table { width:100%; border-collapse:collapse; font-size:0.9rem; }
     th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--border); vertical-align:top; }
     th { color:var(--muted); font-weight:700; }
@@ -280,6 +282,24 @@ export function renderUsageReportUiHtml(): string {
     .user-cell { display:flex; gap:8px; align-items:flex-start; }
     .avatar { width:30px; height:30px; border-radius:999px; object-fit:cover; border:1px solid var(--border); background:#e9f1fc; }
     .meta-line { color:var(--muted); font-size:0.8rem; }
+    .error-line { margin:8px 0 0; color:#b42318; font-size:0.84rem; }
+    .status-box { margin-top:8px; font-size:0.82rem; color:var(--muted); }
+    .table-wrap { overflow:auto; }
+    .table-browser-table td { max-width:210px; }
+    .table-browser-table summary { cursor:pointer; color:#0f3f9f; }
+    .table-browser-controls { gap:10px; }
+    .table-browser-pagination { margin-top:10px; }
+    .sr-only {
+      position:absolute;
+      width:1px;
+      height:1px;
+      padding:0;
+      margin:-1px;
+      overflow:hidden;
+      clip:rect(0,0,0,0);
+      white-space:nowrap;
+      border:0;
+    }
     pre { margin:4px 0 0; white-space:pre-wrap; word-break:break-word; font-size:0.75rem; max-width:420px; }
   </style>
 </head>
@@ -338,6 +358,90 @@ export function renderUsageReportUiHtml(): string {
         </tbody>
       </table>
     </section>
+
+    <section class="card" aria-label="Postgres table browser" data-testid="pg-table-browser">
+      <div class="row">
+        <div>
+          <h2>Postgres Table Browser</h2>
+          <div class="meta-line" x-text="tableMetaText"></div>
+        </div>
+        <div class="row table-browser-controls">
+          <label for="tableSelect" class="sr-only">Choose table</label>
+          <select
+            id="tableSelect"
+            x-model="selectedTable"
+            @change="selectTable(selectedTable)"
+            aria-label="Choose table"
+            data-testid="table-select"
+            :disabled="tableNames.length === 0 || tableLoading"
+          >
+            <template x-for="name in tableNames" :key="name">
+              <option :value="name" x-text="name"></option>
+            </template>
+          </select>
+          <button
+            type="button"
+            @click="reloadTableNames()"
+            aria-label="Refresh table list"
+            data-testid="table-refresh"
+            :disabled="tableLoading"
+          >Refresh Tables</button>
+        </div>
+      </div>
+
+      <div class="status-box" role="status" aria-live="polite" data-testid="table-status" x-text="tableStatusText"></div>
+      <p class="error-line" role="alert" aria-live="assertive" x-show="tableError" x-text="tableError"></p>
+
+      <div class="table-wrap" x-show="!tableLoading && tableRows.length > 0">
+        <table class="table-browser-table" aria-label="Table rows" data-testid="table-data">
+          <thead>
+            <tr>
+              <th>#</th>
+              <template x-for="column in visibleTableColumns()" :key="'header-' + column">
+                <th class="mono" x-text="column"></th>
+              </template>
+              <th>Details</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="(row, idx) in tableRows" :key="(row.id || row.record_id || row.group_id || row.endpoint || idx) + '-' + idx">
+              <tr>
+                <td class="mono" x-text="tableOffset + idx + 1"></td>
+                <template x-for="column in visibleTableColumns()" :key="'cell-' + idx + '-' + column">
+                  <td class="mono" x-text="shortValue(row[column])"></td>
+                </template>
+                <td>
+                  <details>
+                    <summary>JSON</summary>
+                    <pre x-text="JSON.stringify(row, null, 2)"></pre>
+                  </details>
+                </td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+
+      <p class="meta-line" x-show="!tableLoading && !tableError && tableRows.length === 0">No rows found.</p>
+
+      <div class="row table-browser-pagination" x-show="tableTotal > 0">
+        <button
+          type="button"
+          @click="prevTablePage()"
+          aria-label="Previous table page"
+          data-testid="table-prev"
+          :disabled="tableOffset <= 0 || tableLoading"
+        >Previous</button>
+        <span class="mono" x-text="tableRangeText()"></span>
+        <button
+          type="button"
+          @click="nextTablePage()"
+          aria-label="Next table page"
+          data-testid="table-next"
+          :disabled="(tableOffset + tableLimit) >= tableTotal || tableLoading"
+        >Next</button>
+      </div>
+    </section>
   </main>
   <script>
     const RELAYS = ${relayJson};
@@ -352,6 +456,17 @@ export function renderUsageReportUiHtml(): string {
         metaText: 'Loading...',
         db: null,
         inflight: new Map(),
+        tableNames: [],
+        selectedTable: '',
+        tableColumns: [],
+        tableRows: [],
+        tableTotal: 0,
+        tableOffset: 0,
+        tableLimit: 25,
+        tableLoading: false,
+        tableError: '',
+        tableMetaText: 'Loading tables...',
+        tableStatusText: 'Loading...',
 
         async init() {
           this.db = new Dexie('superbased_admin_ui');
@@ -359,6 +474,7 @@ export function renderUsageReportUiHtml(): string {
             kind0_profiles: 'pubkey, fetched_at',
           });
           await this.refresh();
+          await this.reloadTableNames();
         },
 
         fmtBytes(v) {
@@ -397,17 +513,128 @@ export function renderUsageReportUiHtml(): string {
           await this.hydrateProfiles();
         },
 
-        async loadReport() {
-          const res = await fetch('/ui/report', { credentials: 'include' });
+        async fetchUiJson(path) {
+          const res = await fetch(path, { credentials: 'include' });
           if (res.status === 401) {
             window.location.href = '/ui';
-            return { rows: [] };
+            return null;
           }
           const raw = await res.text();
           let data = {};
           try { data = JSON.parse(raw); } catch {}
           if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
           return data;
+        },
+
+        async loadReport() {
+          const data = await this.fetchUiJson('/ui/report');
+          return data || { rows: [] };
+        },
+
+        visibleTableColumns() {
+          return (this.tableColumns || []).slice(0, 6);
+        },
+
+        shortValue(value) {
+          if (value === null || value === undefined) return '';
+          const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+          if (text.length <= 120) return text;
+          return text.slice(0, 117) + '...';
+        },
+
+        tablePageCount() {
+          return Math.max(1, Math.ceil(this.tableTotal / this.tableLimit));
+        },
+
+        tablePageNumber() {
+          return Math.floor(this.tableOffset / this.tableLimit) + 1;
+        },
+
+        tableRangeText() {
+          if (this.tableTotal <= 0) return '0 rows';
+          const start = this.tableOffset + 1;
+          const end = Math.min(this.tableOffset + this.tableRows.length, this.tableTotal);
+          return 'Rows ' + start + '-' + end + ' of ' + this.tableTotal + ' | page ' + this.tablePageNumber() + '/' + this.tablePageCount();
+        },
+
+        async reloadTableNames() {
+          this.tableLoading = true;
+          this.tableError = '';
+          this.tableStatusText = 'Loading table list...';
+          try {
+            const data = await this.fetchUiJson('/ui/tables');
+            const tableNames = Array.isArray(data?.tables) ? data.tables : [];
+            this.tableNames = tableNames;
+
+            if (tableNames.length === 0) {
+              this.selectedTable = '';
+              this.tableColumns = [];
+              this.tableRows = [];
+              this.tableTotal = 0;
+              this.tableOffset = 0;
+              this.tableMetaText = 'No superbased_* tables found.';
+              this.tableStatusText = this.tableMetaText;
+              return;
+            }
+
+            if (!tableNames.includes(this.selectedTable)) {
+              this.selectedTable = tableNames[0];
+              this.tableOffset = 0;
+            }
+
+            await this.loadSelectedTable();
+          } catch (err) {
+            this.tableError = String(err);
+            this.tableStatusText = 'Failed to load table list.';
+          } finally {
+            this.tableLoading = false;
+          }
+        },
+
+        async selectTable(name) {
+          this.selectedTable = name || '';
+          this.tableOffset = 0;
+          await this.loadSelectedTable();
+        },
+
+        async loadSelectedTable() {
+          if (!this.selectedTable) return;
+          this.tableLoading = true;
+          this.tableError = '';
+          this.tableStatusText = 'Loading ' + this.selectedTable + '...';
+          try {
+            const path = '/ui/tables/' + encodeURIComponent(this.selectedTable)
+              + '?limit=' + this.tableLimit
+              + '&offset=' + this.tableOffset;
+            const data = await this.fetchUiJson(path);
+            this.tableColumns = Array.isArray(data?.columns) ? data.columns : [];
+            this.tableRows = Array.isArray(data?.rows) ? data.rows : [];
+            this.tableTotal = Number(data?.total || 0);
+            this.tableMetaText = this.selectedTable + ' | total rows: ' + this.tableTotal;
+            this.tableStatusText = this.tableRangeText();
+          } catch (err) {
+            this.tableRows = [];
+            this.tableColumns = [];
+            this.tableTotal = 0;
+            this.tableError = String(err);
+            this.tableStatusText = 'Failed to load table rows.';
+          } finally {
+            this.tableLoading = false;
+          }
+        },
+
+        async prevTablePage() {
+          if (this.tableLoading || this.tableOffset <= 0) return;
+          this.tableOffset = Math.max(0, this.tableOffset - this.tableLimit);
+          await this.loadSelectedTable();
+        },
+
+        async nextTablePage() {
+          if (this.tableLoading) return;
+          const nextOffset = this.tableOffset + this.tableLimit;
+          if (nextOffset >= this.tableTotal) return;
+          this.tableOffset = nextOffset;
+          await this.loadSelectedTable();
         },
 
         async hydrateProfiles() {
