@@ -31,9 +31,11 @@ beforeAll(async () => {
       encrypted_data  text NOT NULL,
       encrypted_from  text NOT NULL,
       delegate_payloads jsonb,
+      group_payloads jsonb,
       created_at      timestamptz NOT NULL DEFAULT now()
     )
   `;
+  await sql`ALTER TABLE ${sql(TABLE)} ADD COLUMN IF NOT EXISTS group_payloads jsonb`;
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_records_v3_version
     ON ${sql(TABLE)} (app_pubkey, record_id, version)`;
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_records_v3_live

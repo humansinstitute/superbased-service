@@ -69,6 +69,23 @@ async function main() {
   `;
   console.log('  done');
 
+  // ── superbased_groups ──
+  console.log('Creating superbased_groups...');
+  await sql`
+    CREATE TABLE IF NOT EXISTS superbased_groups (
+      id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      app_pubkey      text NOT NULL,
+      group_id        uuid NOT NULL,
+      group_name      text NOT NULL,
+      group_pubkey    text NOT NULL,
+      owner_pubkey    text NOT NULL,
+      created_at      timestamptz NOT NULL DEFAULT now(),
+      updated_at      timestamptz NOT NULL DEFAULT now(),
+      archived_at     timestamptz
+    )
+  `;
+  console.log('  done');
+
   // ── superbased_group_members ──
   console.log('Creating superbased_group_members...');
   await sql`
@@ -122,8 +139,74 @@ async function main() {
       encrypted_data  text NOT NULL,
       encrypted_from  text NOT NULL,
       delegate_payloads jsonb,
+      group_payloads jsonb,
       created_at      timestamptz NOT NULL DEFAULT now()
     )
+  `;
+  console.log('  done');
+
+  // Ensure new columns exist on older deployments
+  await sql`ALTER TABLE superbased_records_v3 ADD COLUMN IF NOT EXISTS group_payloads jsonb`;
+
+  // Normalize older deployments to the canonical uuid contract for record IDs.
+  console.log('Normalizing superbased_records_v3.record_id to uuid if needed...');
+  await sql`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'superbased_records_v3'
+          AND column_name = 'record_id'
+          AND udt_name = 'text'
+      ) THEN
+        ALTER TABLE superbased_records_v3
+          ALTER COLUMN record_id TYPE uuid
+          USING record_id::uuid;
+      END IF;
+    END
+    $$;
+  `;
+  console.log('  done');
+
+  // ── superbased_record_group_access ──
+  console.log('Creating superbased_record_group_access...');
+  await sql`
+    CREATE TABLE IF NOT EXISTS superbased_record_group_access (
+      id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      app_pubkey      text NOT NULL,
+      collection      text NOT NULL,
+      record_id       uuid NOT NULL,
+      group_id        uuid NOT NULL,
+      can_read        boolean NOT NULL DEFAULT true,
+      can_write       boolean NOT NULL DEFAULT false,
+      created_by      text NOT NULL,
+      created_at      timestamptz NOT NULL DEFAULT now(),
+      updated_at      timestamptz NOT NULL DEFAULT now(),
+      revoked_at      timestamptz
+    )
+  `;
+  console.log('  done');
+
+  console.log('Normalizing superbased_record_group_access.record_id to uuid if needed...');
+  await sql`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = 'public'
+          AND table_name = 'superbased_record_group_access'
+          AND column_name = 'record_id'
+          AND udt_name = 'text'
+      ) THEN
+        ALTER TABLE superbased_record_group_access
+          ALTER COLUMN record_id TYPE uuid
+          USING record_id::uuid;
+      END IF;
+    END
+    $$;
   `;
   console.log('  done');
 
@@ -209,10 +292,67 @@ async function main() {
       ON superbased_records_v3 (app_pubkey, user_pubkey, record_state)
   `;
 
+  console.log('  idx_records_v3_changes_check...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_records_v3_changes_check
+      ON superbased_records_v3 (app_pubkey, user_pubkey, collection, created_at DESC)
+      WHERE record_state = 'live'
+  `;
+
   console.log('  idx_records_v3_delegates (GIN)...');
   await sql`
     CREATE INDEX IF NOT EXISTS idx_records_v3_delegates
       ON superbased_records_v3 USING GIN (delegate_payloads)
+  `;
+
+  console.log('  idx_records_v3_groups (GIN)...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_records_v3_groups
+      ON superbased_records_v3 USING GIN (group_payloads)
+  `;
+
+  console.log('  uq_groups_identity...');
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_groups_identity
+      ON superbased_groups (app_pubkey, group_id)
+  `;
+
+  // Backfill canonical groups from existing membership seeds (legacy schema)
+  console.log('  backfill_groups_from_members...');
+  await sql`
+    INSERT INTO superbased_groups (app_pubkey, group_id, group_name, group_pubkey, owner_pubkey)
+    SELECT DISTINCT ON (m.app_pubkey, m.group_id)
+      m.app_pubkey,
+      m.group_id,
+      m.group_name,
+      m.group_pubkey,
+      m.owner_pubkey
+    FROM superbased_group_members m
+    WHERE m.revoked_at IS NULL
+    ORDER BY
+      m.app_pubkey,
+      m.group_id,
+      CASE WHEN m.role = 'owner' THEN 0 ELSE 1 END,
+      m.created_at ASC
+    ON CONFLICT (app_pubkey, group_id)
+    DO UPDATE SET
+      group_name = EXCLUDED.group_name,
+      group_pubkey = EXCLUDED.group_pubkey,
+      owner_pubkey = EXCLUDED.owner_pubkey,
+      archived_at = NULL,
+      updated_at = now()
+  `;
+
+  console.log('  idx_groups_owner_lookup...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_groups_owner_lookup
+      ON superbased_groups (app_pubkey, owner_pubkey, archived_at)
+  `;
+
+  console.log('  idx_groups_pubkey_lookup...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_groups_pubkey_lookup
+      ON superbased_groups (app_pubkey, group_pubkey, archived_at)
   `;
 
   console.log('  uq_group_members_active...');
@@ -257,6 +397,25 @@ async function main() {
   await sql`
     CREATE INDEX IF NOT EXISTS idx_group_requests_requester_status
       ON superbased_group_requests (app_pubkey, requester_pubkey, status, created_at DESC)
+  `;
+
+  console.log('  uq_record_group_access_active...');
+  await sql`
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_record_group_access_active
+      ON superbased_record_group_access (app_pubkey, collection, record_id, group_id)
+      WHERE revoked_at IS NULL
+  `;
+
+  console.log('  idx_record_group_access_record...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_record_group_access_record
+      ON superbased_record_group_access (app_pubkey, collection, record_id, revoked_at)
+  `;
+
+  console.log('  idx_record_group_access_group...');
+  await sql`
+    CREATE INDEX IF NOT EXISTS idx_record_group_access_group
+      ON superbased_record_group_access (app_pubkey, group_id, revoked_at)
   `;
 
   console.log('  uq_push_subscription_endpoint...');

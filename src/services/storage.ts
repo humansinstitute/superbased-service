@@ -1,7 +1,8 @@
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHmac } from 'node:crypto';
 import { S3Client, HeadObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
+import { bytesToHex } from '@noble/hashes/utils';
 import { getDb } from '../db/postgres';
 import { getConfig } from '../config';
 import { delegationsService } from './delegations';
@@ -185,8 +186,10 @@ class StorageService {
     return toStorageOutput(updated[0]);
   }
 
-  async getDownloadUrl(appPubkey: string, auth: AuthContext, objectId: string): Promise<{ download_url: string; expires_in_seconds: number }> {
+  async getDownloadUrl(appPubkey: string, auth: AuthContext, objectId: string, ttlSeconds?: number): Promise<{ download_url: string; expires_in_seconds: number }> {
     this.ensureEnabled();
+
+    const MAX_DOWNLOAD_TTL = 72 * 60 * 60; // 72 hours
 
     const sql = getDb();
     const rows = await sql`
@@ -219,7 +222,10 @@ class StorageService {
       Key: row.object_key,
     });
 
-    const expiresIn = this.config.storagePresignDownloadTtlSeconds;
+    const expiresIn = Math.min(
+      ttlSeconds && ttlSeconds > 0 ? ttlSeconds : this.config.storagePresignDownloadTtlSeconds,
+      MAX_DOWNLOAD_TTL
+    );
     const downloadUrl = await getSignedUrl(this.presignS3, command, { expiresIn });
 
     return { download_url: downloadUrl, expires_in_seconds: expiresIn };
@@ -305,6 +311,52 @@ class StorageService {
       max_bytes: this.config.storageMaxBytesPerNpub,
       available_bytes: Math.max(this.config.storageMaxBytesPerNpub - usedBytes, 0),
     };
+  }
+
+  createShareToken(objectId: string, ttlSeconds: number): { token: string; expires_at: string } {
+    const MAX_SHARE_TTL = 72 * 60 * 60; // 72 hours
+    const ttl = Math.min(Math.max(ttlSeconds, 60), MAX_SHARE_TTL);
+    const expiresAt = Math.floor(Date.now() / 1000) + ttl;
+    const payload = `${objectId}:${expiresAt}`;
+    const secret = bytesToHex(this.config.serverPrivateKey);
+    const sig = createHmac('sha256', secret).update(payload).digest('hex').slice(0, 32);
+    const token = Buffer.from(`${payload}:${sig}`).toString('base64url');
+    return { token, expires_at: new Date(expiresAt * 1000).toISOString() };
+  }
+
+  async resolveShareToken(token: string): Promise<string> {
+    const decoded = Buffer.from(token, 'base64url').toString();
+    const parts = decoded.split(':');
+    if (parts.length !== 3) throw new Error('invalid_token');
+    const [objectId, expiresAtStr, sig] = parts;
+    const expiresAt = parseInt(expiresAtStr, 10);
+    if (isNaN(expiresAt) || expiresAt < Math.floor(Date.now() / 1000)) {
+      throw new Error('token_expired');
+    }
+    const payload = `${objectId}:${expiresAt}`;
+    const secret = bytesToHex(this.config.serverPrivateKey);
+    const expected = createHmac('sha256', secret).update(payload).digest('hex').slice(0, 32);
+    if (sig !== expected) throw new Error('invalid_token');
+
+    const appPubkey = this.config.serverPublicKey;
+    const sql = getDb();
+    const rows = await sql`
+      SELECT * FROM ${sql(TABLE)}
+      WHERE id = ${objectId}
+        AND status = 'ready'
+        AND deleted_at IS NULL
+        AND (expires_at IS NULL OR expires_at > now())
+      LIMIT 1
+    `;
+    if (rows.length === 0) throw new Error('object_not_found');
+    const row = rows[0] as any;
+
+    const command = new GetObjectCommand({
+      Bucket: row.bucket,
+      Key: row.object_key,
+    });
+    const presignTtl = Math.min(expiresAt - Math.floor(Date.now() / 1000), 72 * 60 * 60);
+    return await getSignedUrl(this.presignS3, command, { expiresIn: presignTtl });
   }
 
   async pruneExpired(limit = 200): Promise<number> {

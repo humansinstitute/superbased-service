@@ -63,6 +63,7 @@ export interface SyncRecordInputV3 {
   encrypted_from: string;
   collection?: string;
   delegate_payloads?: Record<string, string>;
+  group_payloads?: Record<string, string>;
   owner_pubkey?: string;
 }
 
@@ -90,12 +91,23 @@ export interface RecordOutputV3 {
   encrypted_data: string;
   encrypted_from: string;
   delegate_payloads?: Record<string, string>;
+  group_payloads?: Record<string, string>;
   created_at: string | null;
 }
 
 // Result from fetch
 export interface FetchResultV3 {
   records: RecordOutputV3[];
+}
+
+export interface CollectionChangeSummary {
+  changed_count: number;
+  latest_created_at: string | null;
+}
+
+export interface ChangesCheckResultV3 {
+  changed: boolean;
+  changes: Record<string, CollectionChangeSummary>;
 }
 
 // Record as returned to a delegate via /delegated
@@ -105,7 +117,11 @@ export interface DelegatedRecordOutputV3 {
   collection: string;
   owner_pubkey: string;
   encrypted_from: string;
-  delegate_payload: string;
+  access_mode?: 'delegate' | 'group';
+  delegate_payload?: string;
+  group_payload?: string;
+  group_id?: string;
+  can_write?: boolean;
   created_at: string | null;
 }
 
@@ -122,6 +138,7 @@ export interface HistoryVersionV3 {
   created_at: string | null;
   encrypted_data?: string;
   delegate_payloads?: Record<string, string>;
+  group_payloads?: Record<string, string>;
 }
 
 // Result from history endpoint
@@ -263,6 +280,17 @@ export interface ResolveGroupRequestInput {
   status: Exclude<GroupRequestStatus, 'pending'>;
   member_encrypted_group_key?: string;
   role?: Exclude<GroupRole, 'owner'>;
+}
+
+// ==================== RECORD GROUP ACCESS TYPES ====================
+
+export type RecordGroupPermission = 'read' | 'write';
+
+export interface UpsertRecordGroupAccessInput {
+  collection: string;
+  record_id: string;
+  group_id: string;
+  permission: RecordGroupPermission;
 }
 
 // ==================== PUSH TYPES ====================

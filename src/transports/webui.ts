@@ -275,8 +275,16 @@ export function renderUsageReportUiHtml(): string {
     button { border:0; border-radius:10px; padding:9px 12px; font-weight:700; color:#fff; background:var(--accent); cursor:pointer; }
     button:disabled { opacity:0.55; cursor:not-allowed; }
     select { border:1px solid var(--border); border-radius:10px; padding:8px 10px; font-family:var(--sans); min-width:240px; background:#fff; }
-    table { width:100%; border-collapse:collapse; font-size:0.9rem; }
-    th, td { text-align:left; padding:8px 6px; border-bottom:1px solid var(--border); vertical-align:top; }
+    table { width:100%; border-collapse:collapse; font-size:0.9rem; table-layout:fixed; }
+    th, td {
+      text-align:left;
+      padding:8px 6px;
+      border-bottom:1px solid var(--border);
+      vertical-align:top;
+      white-space:normal;
+      overflow-wrap:anywhere;
+      word-break:break-word;
+    }
     th { color:var(--muted); font-weight:700; }
     .mono { font-family:var(--mono); }
     .user-cell { display:flex; gap:8px; align-items:flex-start; }
@@ -285,6 +293,7 @@ export function renderUsageReportUiHtml(): string {
     .error-line { margin:8px 0 0; color:#b42318; font-size:0.84rem; }
     .status-box { margin-top:8px; font-size:0.82rem; color:var(--muted); }
     .table-wrap { overflow:auto; }
+    .table-browser-table { table-layout:fixed; }
     .table-browser-table td { max-width:210px; }
     .table-browser-table summary { cursor:pointer; color:#0f3f9f; }
     .table-browser-controls { gap:10px; }
@@ -450,12 +459,22 @@ export function renderUsageReportUiHtml(): string {
     const PROFILE_FETCH_WORKERS = 4;
 
     function usageReportApp() {
+      let db = null;
+      const inflight = new Map();
+
+      function toPlainObject(value) {
+        if (!value || typeof value !== 'object') return {};
+        try {
+          return JSON.parse(JSON.stringify(value));
+        } catch {
+          return {};
+        }
+      }
+
       return {
         rows: [],
         profiles: {},
         metaText: 'Loading...',
-        db: null,
-        inflight: new Map(),
         tableNames: [],
         selectedTable: '',
         tableColumns: [],
@@ -469,8 +488,8 @@ export function renderUsageReportUiHtml(): string {
         tableStatusText: 'Loading...',
 
         async init() {
-          this.db = new Dexie('superbased_admin_ui');
-          this.db.version(1).stores({
+          db = new Dexie('superbased_admin_ui');
+          db.version(1).stores({
             kind0_profiles: 'pubkey, fetched_at',
           });
           await this.refresh();
@@ -638,18 +657,19 @@ export function renderUsageReportUiHtml(): string {
         },
 
         async hydrateProfiles() {
+          if (!db) return;
           const pubkeys = Array.from(new Set(this.rows.map((r) => r.user_pubkey).filter(Boolean)));
           if (pubkeys.length === 0) return;
 
           const now = Date.now();
-          const cachedRows = await this.db.kind0_profiles.where('pubkey').anyOf(pubkeys).toArray();
+          const cachedRows = await db.kind0_profiles.where('pubkey').anyOf(pubkeys).toArray();
           const cachedByPubkey = new Map(cachedRows.map((r) => [r.pubkey, r]));
           const toRefresh = [];
 
           for (const pubkey of pubkeys) {
             const cached = cachedByPubkey.get(pubkey);
             if (cached) {
-              this.profiles[pubkey] = cached;
+              this.profiles[pubkey] = toPlainObject(cached);
             }
 
             const fetchedAt = Number(cached?.fetched_at || 0);
@@ -679,12 +699,13 @@ export function renderUsageReportUiHtml(): string {
 
         async refreshSingleProfile(pubkey, nowTs) {
           const now = nowTs || Date.now();
-          if (this.inflight.has(pubkey)) return this.inflight.get(pubkey);
+          if (!db) return;
+          if (inflight.has(pubkey)) return inflight.get(pubkey);
 
           const run = (async () => {
-            await this.db.kind0_profiles.put({
+            await db.kind0_profiles.put({
               pubkey,
-              ...this.profileFor(pubkey),
+              ...toPlainObject(this.profileFor(pubkey)),
               last_attempt_at: now,
             });
 
@@ -705,15 +726,16 @@ export function renderUsageReportUiHtml(): string {
               fetched_at: now,
               last_attempt_at: now,
             };
-            this.profiles[pubkey] = record;
-            await this.db.kind0_profiles.put(record);
+            const plainRecord = toPlainObject(record);
+            this.profiles[pubkey] = plainRecord;
+            await db.kind0_profiles.put(plainRecord);
           })();
 
-          this.inflight.set(pubkey, run);
+          inflight.set(pubkey, run);
           try {
             await run;
           } finally {
-            this.inflight.delete(pubkey);
+            inflight.delete(pubkey);
           }
         },
 

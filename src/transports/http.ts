@@ -10,6 +10,7 @@ import { recordsService } from '../services/records';
 import { usersService } from '../services/users';
 import { delegationsService } from '../services/delegations';
 import { groupsService } from '../services/groups';
+import { recordGroupAccessService } from '../services/record-group-access';
 import { pushService } from '../services/push';
 import { usageReportService } from '../services/usage-report';
 import { storageService } from '../services/storage';
@@ -24,6 +25,7 @@ import type {
   PushSubscriptionUpsertInput,
   PushSubscriptionDeleteInput,
   ResolveGroupRequestInput,
+  UpsertRecordGroupAccessInput,
   StoragePrepareUploadInput,
   StorageCompleteUploadInput,
 } from '../types';
@@ -135,6 +137,11 @@ function parseOffset(value: string | undefined): number {
   const parsed = Number.parseInt(value || '', 10);
   if (!Number.isFinite(parsed) || parsed < 0) return 0;
   return parsed;
+}
+
+function normalizeRecordGroupPermission(value: string | undefined): 'read' | 'write' {
+  if (value === 'write') return 'write';
+  return 'read';
 }
 
 function normalizeUiTableName(value: string | undefined): string | null {
@@ -571,13 +578,77 @@ export function createHttpServer() {
     const auth = c.get('auth');
     const appPubkey = resolveDefaultNamespacePubkey();
     const objectId = c.req.param('objectId');
+    const ttlParam = c.req.query('ttl');
+    const ttlSeconds = ttlParam ? parseInt(ttlParam, 10) : undefined;
 
     const access = await usersService.checkUserAccess(auth.pubkey);
     if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
 
     try {
-      const result = await storageService.getDownloadUrl(appPubkey, auth, objectId);
+      const result = await storageService.getDownloadUrl(appPubkey, auth, objectId, ttlSeconds);
       return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 404);
+    }
+  });
+
+  // Create a shareable link (NIP-98 auth required, returns short token URL)
+  app.post('/storage/:objectId/share', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const objectId = c.req.param('objectId');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let ttlSeconds = 72 * 60 * 60; // default 72 hours
+    try {
+      const body = await c.req.json();
+      if (body.ttl_seconds) ttlSeconds = parseInt(body.ttl_seconds, 10);
+    } catch { /* use default */ }
+
+    try {
+      // Verify the caller owns the object
+      const result = await storageService.getDownloadUrl(appPubkey, auth, objectId);
+      const share = storageService.createShareToken(objectId, ttlSeconds);
+      const baseUrl = c.req.url.split('/storage/')[0];
+      return c.json({
+        share_url: `${baseUrl}/storage/shared/${share.token}`,
+        expires_at: share.expires_at,
+        token: share.token,
+      }, 201);
+    } catch (err) {
+      return c.json({ error: String(err) }, 404);
+    }
+  });
+
+  // Public download via share token (no auth needed)
+  app.get('/storage/shared/:token', async (c) => {
+    const token = c.req.param('token');
+    try {
+      const presignedUrl = await storageService.resolveShareToken(token);
+      return c.redirect(presignedUrl, 302);
+    } catch (err) {
+      const msg = String(err);
+      if (msg.includes('expired')) return c.json({ error: 'Link expired' }, 410);
+      return c.json({ error: 'Invalid or expired link' }, 404);
+    }
+  });
+
+  // Direct download redirect — NIP-98 auth, redirects to presigned S3 URL
+  app.get('/storage/:objectId/download', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const objectId = c.req.param('objectId');
+    const ttlParam = c.req.query('ttl');
+    const ttlSeconds = ttlParam ? parseInt(ttlParam, 10) : undefined;
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    try {
+      const result = await storageService.getDownloadUrl(appPubkey, auth, objectId, ttlSeconds);
+      return c.redirect(result.download_url, 302);
     } catch (err) {
       return c.json({ error: String(err) }, 404);
     }
@@ -1210,6 +1281,82 @@ export function createHttpServer() {
 
   // ==================== Record Sync Routes (v3) ====================
 
+  // Upsert record-level group access in default namespace (app-less mode)
+  app.put('/records/group-access', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let input: UpsertRecordGroupAccessInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!input?.collection || !input?.record_id || !input?.group_id) {
+      return c.json({ error: 'collection, record_id, group_id required' }, 400);
+    }
+
+    try {
+      const permission = normalizeRecordGroupPermission(input.permission);
+      const entry = await recordGroupAccessService.upsertGroupAccess(appPubkey, auth, {
+        collection: input.collection,
+        record_id: input.record_id,
+        group_id: input.group_id,
+        can_read: permission === 'read' || permission === 'write',
+        can_write: permission === 'write',
+      });
+      return c.json({ access: entry });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // List record-level group access in default namespace (app-less mode)
+  app.get('/records/group-access', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const collection = c.req.query('collection') || '';
+    const recordId = c.req.query('record_id') || '';
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+    if (!collection || !recordId) return c.json({ error: 'collection and record_id query parameters required' }, 400);
+
+    try {
+      const rows = await recordGroupAccessService.listGroupAccess(appPubkey, auth, collection, recordId);
+      return c.json({ access: rows });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // Revoke record-level group access in default namespace (app-less mode)
+  app.delete('/records/group-access', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+    const collection = c.req.query('collection') || '';
+    const recordId = c.req.query('record_id') || '';
+    const groupId = c.req.query('group_id') || '';
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+    if (!collection || !recordId || !groupId) {
+      return c.json({ error: 'collection, record_id, group_id query parameters required' }, 400);
+    }
+
+    try {
+      const revoked = await recordGroupAccessService.revokeGroupAccess(appPubkey, auth, collection, recordId, groupId);
+      if (!revoked) return c.json({ error: 'Record/group access not found' }, 404);
+      return c.json({ success: true });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
   // Push config in default namespace (app-less mode)
   app.get('/push/config', authMiddleware, async (c) => {
     const auth = c.get('auth');
@@ -1326,6 +1473,43 @@ export function createHttpServer() {
 
     try {
       const result = await recordsService.fetchRecords(appPubkey, auth, collection, since);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.post('/records/changes', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appPubkey = resolveDefaultNamespacePubkey();
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let collections: string[];
+    let sinceByCollection: Record<string, string>;
+    try {
+      const body = await c.req.json();
+      collections = body.collections;
+      sinceByCollection = body.since_by_collection ?? {};
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!Array.isArray(collections) || collections.length === 0 || collections.some((value) => typeof value !== 'string' || value.length === 0)) {
+      return c.json({ error: 'collections non-empty array required' }, 400);
+    }
+    if (
+      typeof sinceByCollection !== 'object' ||
+      sinceByCollection === null ||
+      Array.isArray(sinceByCollection) ||
+      Object.values(sinceByCollection).some((value) => typeof value !== 'string')
+    ) {
+      return c.json({ error: 'since_by_collection must be an object of ISO timestamps' }, 400);
+    }
+
+    try {
+      const result = await recordsService.checkChanges(appPubkey, auth, collections, sinceByCollection);
       return c.json(result);
     } catch (err) {
       return c.json({ error: String(err) }, 500);
@@ -1520,6 +1704,103 @@ export function createHttpServer() {
     return c.json({ subscriptions });
   });
 
+  // Upsert record-level group access in app namespace
+  app.put('/records/:appNpub/group-access', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    let input: UpsertRecordGroupAccessInput;
+    try {
+      input = await c.req.json();
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!input?.collection || !input?.record_id || !input?.group_id) {
+      return c.json({ error: 'collection, record_id, group_id required' }, 400);
+    }
+
+    try {
+      const permission = normalizeRecordGroupPermission(input.permission);
+      const entry = await recordGroupAccessService.upsertGroupAccess(appPubkey, auth, {
+        collection: input.collection,
+        record_id: input.record_id,
+        group_id: input.group_id,
+        can_read: permission === 'read' || permission === 'write',
+        can_write: permission === 'write',
+      });
+      return c.json({ access: entry });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // List record-level group access in app namespace
+  app.get('/records/:appNpub/group-access', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const collection = c.req.query('collection') || '';
+    const recordId = c.req.query('record_id') || '';
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+    if (!collection || !recordId) return c.json({ error: 'collection and record_id query parameters required' }, 400);
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    try {
+      const rows = await recordGroupAccessService.listGroupAccess(appPubkey, auth, collection, recordId);
+      return c.json({ access: rows });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
+  // Revoke record-level group access in app namespace
+  app.delete('/records/:appNpub/group-access', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+    const collection = c.req.query('collection') || '';
+    const recordId = c.req.query('record_id') || '';
+    const groupId = c.req.query('group_id') || '';
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) return c.json({ error: access.reason || 'Access denied' }, 403);
+    if (!collection || !recordId || !groupId) {
+      return c.json({ error: 'collection, record_id, group_id query parameters required' }, 400);
+    }
+
+    let appPubkey: string;
+    try {
+      appPubkey = resolveAppPubkey(appNpub).pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    try {
+      const revoked = await recordGroupAccessService.revokeGroupAccess(appPubkey, auth, collection, recordId, groupId);
+      if (!revoked) return c.json({ error: 'Record/group access not found' }, 404);
+      return c.json({ success: true });
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+  });
+
   // Sync records
   app.post('/records/:appNpub/sync', authMiddleware, async (c) => {
     const auth = c.get('auth');
@@ -1590,6 +1871,53 @@ export function createHttpServer() {
 
     try {
       const result = await recordsService.fetchRecords(appPubkey, auth, collection, since);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: String(err) }, 500);
+    }
+  });
+
+  app.post('/records/:appNpub/changes', authMiddleware, async (c) => {
+    const auth = c.get('auth');
+    const appNpub = c.req.param('appNpub');
+
+    const access = await usersService.checkUserAccess(auth.pubkey);
+    if (!access.allowed) {
+      return c.json({ error: access.reason || 'Access denied' }, 403);
+    }
+
+    let appPubkey: string;
+    try {
+      const resolved = resolveAppPubkey(appNpub);
+      appPubkey = resolved.pubkey;
+    } catch (err) {
+      return c.json({ error: String(err) }, 400);
+    }
+
+    let collections: string[];
+    let sinceByCollection: Record<string, string>;
+    try {
+      const body = await c.req.json();
+      collections = body.collections;
+      sinceByCollection = body.since_by_collection ?? {};
+    } catch {
+      return c.json({ error: 'Invalid JSON body' }, 400);
+    }
+
+    if (!Array.isArray(collections) || collections.length === 0 || collections.some((value) => typeof value !== 'string' || value.length === 0)) {
+      return c.json({ error: 'collections non-empty array required' }, 400);
+    }
+    if (
+      typeof sinceByCollection !== 'object' ||
+      sinceByCollection === null ||
+      Array.isArray(sinceByCollection) ||
+      Object.values(sinceByCollection).some((value) => typeof value !== 'string')
+    ) {
+      return c.json({ error: 'since_by_collection must be an object of ISO timestamps' }, 400);
+    }
+
+    try {
+      const result = await recordsService.checkChanges(appPubkey, auth, collections, sinceByCollection);
       return c.json(result);
     } catch (err) {
       return c.json({ error: String(err) }, 500);

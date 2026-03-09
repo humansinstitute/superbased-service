@@ -1,5 +1,6 @@
 import { generateSecretKey, getPublicKey } from 'nostr-tools';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils';
+import { existsSync } from 'node:fs';
 
 export interface Config {
   // HTTP Server
@@ -49,6 +50,27 @@ function getEnvOptional(key: string, defaultValue: string): string {
   return process.env[key] ?? defaultValue;
 }
 
+function runningInDocker(): boolean {
+  return existsSync('/.dockerenv');
+}
+
+function normalizePostgresUrl(rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl);
+    // Developer ergonomics: `.env` often uses docker-internal host `postgres`.
+    // When running CLI from host shell, route that hostname to localhost.
+    if (!runningInDocker() && parsed.hostname === 'postgres') {
+      const hostPort = (process.env.POSTGRES_HOST_PORT || '55432').trim();
+      parsed.hostname = 'localhost';
+      if (hostPort) parsed.port = hostPort;
+      return parsed.toString();
+    }
+  } catch {
+    // Return raw value if it's not a valid URL; postgres client will surface a clear error.
+  }
+  return rawUrl;
+}
+
 export function loadConfig(): Config {
   // Generate or load server key
   let serverPrivateKey: Uint8Array;
@@ -89,7 +111,9 @@ export function loadConfig(): Config {
     serviceToken: process.env.SERVICE_TOKEN || null,
 
     // Postgres
-    postgresUrl: getEnvOptional('POSTGRES_URL', 'postgres://postgres:postgres@localhost:5432/fluxbase'),
+    postgresUrl: normalizePostgresUrl(
+      getEnvOptional('POSTGRES_URL', 'postgres://postgres:postgres@localhost:5432/fluxbase')
+    ),
 
     // Logging
     logLevel: getEnvOptional('LOG_LEVEL', 'info') as Config['logLevel'],

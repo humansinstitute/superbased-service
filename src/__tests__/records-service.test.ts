@@ -16,6 +16,9 @@ import type { AuthContext, SyncRecordInputV3 } from '../types';
 // ── Fixtures ──────────────────────────────────────────────────
 
 const TABLE = 'superbased_records_v3';
+const DELEGATIONS_TABLE = 'superbased_app_delegations';
+const GROUP_MEMBERS_TABLE = 'superbased_group_members';
+const RECORD_GROUP_ACCESS_TABLE = 'superbased_record_group_access';
 const TEST_RUN_ID = process.env.FLUX_TEST_RUN_ID || 'local';
 
 const APP = `test_app_${TEST_RUN_ID}_a`;
@@ -53,7 +56,7 @@ beforeAll(async () => {
     CREATE TABLE IF NOT EXISTS ${sql(TABLE)} (
       id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
       app_pubkey      text NOT NULL,
-      record_id       text NOT NULL,
+      record_id       uuid NOT NULL,
       user_pubkey     text NOT NULL,
       version         integer NOT NULL,
       record_state    text NOT NULL CHECK (record_state IN ('live', 'superseded', 'deleted')),
@@ -61,17 +64,99 @@ beforeAll(async () => {
       encrypted_data  text NOT NULL,
       encrypted_from  text NOT NULL,
       delegate_payloads jsonb,
+      group_payloads jsonb,
       created_at      timestamptz NOT NULL DEFAULT now()
     )
   `;
+  await sql`ALTER TABLE ${sql(TABLE)} ADD COLUMN IF NOT EXISTS group_payloads jsonb`;
+  const recordIdTypeRows = await sql`
+    SELECT udt_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'superbased_records_v3'
+      AND column_name = 'record_id'
+  `;
+  if (recordIdTypeRows[0]?.udt_name === 'text') {
+    await sql`
+      ALTER TABLE ${sql(TABLE)}
+      ALTER COLUMN record_id TYPE uuid
+      USING record_id::uuid
+    `;
+  }
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_records_v3_version
     ON ${sql(TABLE)} (app_pubkey, record_id, version)`;
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_records_v3_live
     ON ${sql(TABLE)} (app_pubkey, record_id) WHERE record_state = 'live'`;
   await sql`CREATE INDEX IF NOT EXISTS idx_records_v3_owner
     ON ${sql(TABLE)} (app_pubkey, user_pubkey, record_state)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_records_v3_changes_check
+    ON ${sql(TABLE)} (app_pubkey, user_pubkey, collection, created_at DESC)
+    WHERE record_state = 'live'`;
   await sql`CREATE INDEX IF NOT EXISTS idx_records_v3_delegates
     ON ${sql(TABLE)} USING GIN (delegate_payloads)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_records_v3_groups
+    ON ${sql(TABLE)} USING GIN (group_payloads)`;
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS ${sql(DELEGATIONS_TABLE)} (
+      id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      app_pubkey      text NOT NULL,
+      owner_pubkey    text NOT NULL,
+      delegate_pubkey text NOT NULL,
+      permissions     text[] NOT NULL DEFAULT ARRAY[]::text[],
+      created_at      timestamptz NOT NULL DEFAULT now(),
+      revoked_at      timestamptz
+    )
+  `;
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS ${sql(GROUP_MEMBERS_TABLE)} (
+      id                  uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      app_pubkey          text NOT NULL,
+      group_id            uuid NOT NULL,
+      group_name          text NOT NULL,
+      group_pubkey        text NOT NULL,
+      owner_pubkey        text NOT NULL,
+      member_pubkey       text NOT NULL,
+      encrypted_group_key text NOT NULL,
+      role                text NOT NULL,
+      invited_by          text,
+      joined_at           timestamptz,
+      created_at          timestamptz NOT NULL DEFAULT now(),
+      updated_at          timestamptz NOT NULL DEFAULT now(),
+      revoked_at          timestamptz
+    )
+  `;
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS ${sql(RECORD_GROUP_ACCESS_TABLE)} (
+      id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      app_pubkey      text NOT NULL,
+      collection      text NOT NULL,
+      record_id       uuid NOT NULL,
+      group_id        uuid NOT NULL,
+      can_read        boolean NOT NULL DEFAULT true,
+      can_write       boolean NOT NULL DEFAULT false,
+      created_by      text NOT NULL,
+      created_at      timestamptz NOT NULL DEFAULT now(),
+      updated_at      timestamptz NOT NULL DEFAULT now(),
+      revoked_at      timestamptz
+    )
+  `;
+  const groupAccessRecordIdTypeRows = await sql`
+    SELECT udt_name
+    FROM information_schema.columns
+    WHERE table_schema = 'public'
+      AND table_name = 'superbased_record_group_access'
+      AND column_name = 'record_id'
+  `;
+  if (groupAccessRecordIdTypeRows[0]?.udt_name === 'text') {
+    await sql`
+      ALTER TABLE ${sql(RECORD_GROUP_ACCESS_TABLE)}
+      ALTER COLUMN record_id TYPE uuid
+      USING record_id::uuid
+    `;
+  }
 
   service = new RecordsService();
 });
@@ -87,6 +172,9 @@ beforeEach(async () => {
     DELETE FROM ${sql(TABLE)}
     WHERE app_pubkey IN (${APP}, ${APP2})
   `;
+  await sql`DELETE FROM ${sql(DELEGATIONS_TABLE)} WHERE app_pubkey IN (${APP}, ${APP2})`;
+  await sql`DELETE FROM ${sql(RECORD_GROUP_ACCESS_TABLE)} WHERE app_pubkey IN (${APP}, ${APP2})`;
+  await sql`DELETE FROM ${sql(GROUP_MEMBERS_TABLE)} WHERE app_pubkey IN (${APP}, ${APP2})`;
 
   // Default: no delegations exist (getDelegation returns null)
   getDelegationSpy = spyOn(delegationsService, 'getDelegation');
@@ -116,6 +204,43 @@ async function totalRows(appPubkey: string, recordId: string) {
     WHERE app_pubkey = ${appPubkey} AND record_id = ${recordId}
   `;
   return count;
+}
+
+async function addGroupMembership(appPubkey: string, groupId: string, memberPubkey: string, ownerPubkey: string = OWNER_PK) {
+  const sql = getDb();
+  await sql`
+    INSERT INTO ${sql(GROUP_MEMBERS_TABLE)} (
+      app_pubkey, group_id, group_name, group_pubkey, owner_pubkey,
+      member_pubkey, encrypted_group_key, role, joined_at
+    ) VALUES (
+      ${appPubkey},
+      ${groupId}::uuid,
+      'Test Group',
+      'group_pubkey_test',
+      ${ownerPubkey},
+      ${memberPubkey},
+      'encrypted_group_key',
+      'member',
+      now()
+    )
+  `;
+}
+
+async function grantRecordGroupAccess(
+  appPubkey: string,
+  recordId: string,
+  groupId: string,
+  canWrite: boolean,
+  collection: string = 'default'
+) {
+  const sql = getDb();
+  await sql`
+    INSERT INTO ${sql(RECORD_GROUP_ACCESS_TABLE)} (
+      app_pubkey, collection, record_id, group_id, can_read, can_write, created_by
+    ) VALUES (
+      ${appPubkey}, ${collection}, ${recordId}, ${groupId}::uuid, true, ${canWrite}, ${OWNER_PK}
+    )
+  `;
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -183,6 +308,21 @@ describe('RecordsService v3', () => {
       expect(fetched.records[0].delegate_payloads).toEqual({
         [DELEGATE_PK]: 'blob_for_delegate',
         [DELEGATE2_PK]: 'blob_for_delegate2',
+      });
+    });
+
+    test('stores group_payloads', async () => {
+      const groupId = crypto.randomUUID();
+      const r = record({
+        group_payloads: {
+          [groupId]: 'blob_for_group',
+        },
+      });
+      await service.syncRecords(APP, auth(OWNER_PK), [r]);
+
+      const fetched = await service.fetchRecords(APP, auth(OWNER_PK));
+      expect(fetched.records[0].group_payloads).toEqual({
+        [groupId]: 'blob_for_group',
       });
     });
 
@@ -486,6 +626,133 @@ describe('RecordsService v3', () => {
     });
   });
 
+  describe('checkChanges', () => {
+    test('returns unchanged summary for an empty collection', async () => {
+      const result = await service.checkChanges(APP, auth(OWNER_PK), ['todos']);
+
+      expect(result).toEqual({
+        changed: false,
+        changes: {
+          todos: {
+            changed_count: 0,
+            latest_created_at: null,
+          },
+        },
+      });
+    });
+
+    test('returns changed count and latest timestamp when records exist', async () => {
+      await service.syncRecords(APP, auth(OWNER_PK), [
+        record({ collection: 'todos' }),
+        record({ collection: 'todos' }),
+      ]);
+
+      const result = await service.checkChanges(APP, auth(OWNER_PK), ['todos']);
+
+      expect(result.changed).toBe(true);
+      expect(result.changes.todos.changed_count).toBe(2);
+      expect(result.changes.todos.latest_created_at).not.toBeNull();
+    });
+
+    test('applies since filter with a future timestamp', async () => {
+      await service.syncRecords(APP, auth(OWNER_PK), [record({ collection: 'todos' })]);
+
+      const result = await service.checkChanges(APP, auth(OWNER_PK), ['todos'], {
+        todos: new Date(Date.now() + 60_000).toISOString(),
+      });
+
+      expect(result).toEqual({
+        changed: false,
+        changes: {
+          todos: {
+            changed_count: 0,
+            latest_created_at: null,
+          },
+        },
+      });
+    });
+
+    test('supports multiple collections with mixed changed and unchanged results', async () => {
+      await service.syncRecords(APP, auth(OWNER_PK), [
+        record({ collection: 'todos' }),
+        record({ collection: 'channels' }),
+      ]);
+
+      const result = await service.checkChanges(
+        APP,
+        auth(OWNER_PK),
+        ['todos', 'chat_messages', 'channels'],
+        {
+          channels: new Date(Date.now() + 60_000).toISOString(),
+        }
+      );
+
+      expect(result.changed).toBe(true);
+      expect(result.changes.todos.changed_count).toBe(1);
+      expect(result.changes.todos.latest_created_at).not.toBeNull();
+      expect(result.changes.chat_messages).toEqual({
+        changed_count: 0,
+        latest_created_at: null,
+      });
+      expect(result.changes.channels).toEqual({
+        changed_count: 0,
+        latest_created_at: null,
+      });
+    });
+
+    test('scopes results to the authenticated owner', async () => {
+      await service.syncRecords(APP, auth(OWNER_PK), [record({ collection: 'todos' })]);
+      await service.syncRecords(APP, auth(OTHER_PK), [record({ collection: 'todos' })]);
+
+      const result = await service.checkChanges(APP, auth(OWNER_PK), ['todos']);
+
+      expect(result.changed).toBe(true);
+      expect(result.changes.todos.changed_count).toBe(1);
+    });
+
+    test('scopes results to the selected app namespace', async () => {
+      await service.syncRecords(APP, auth(OWNER_PK), [record({ collection: 'todos' })]);
+      await service.syncRecords(APP2, auth(OWNER_PK), [record({ collection: 'todos' })]);
+
+      const result = await service.checkChanges(APP, auth(OWNER_PK), ['todos']);
+
+      expect(result.changed).toBe(true);
+      expect(result.changes.todos.changed_count).toBe(1);
+    });
+
+    test('includes delegate-accessible records for the caller', async () => {
+      await service.syncRecords(APP, auth(OWNER_PK), [
+        record({
+          collection: 'documents',
+          delegate_payloads: { [DELEGATE_PK]: 'delegate_blob' },
+        }),
+      ]);
+
+      const result = await service.checkChanges(APP, auth(DELEGATE_PK), ['documents']);
+
+      expect(result.changed).toBe(true);
+      expect(result.changes.documents.changed_count).toBe(1);
+      expect(result.changes.documents.latest_created_at).not.toBeNull();
+    });
+
+    test('includes group-shared records for group members', async () => {
+      const groupId = crypto.randomUUID();
+      const r = record({
+        collection: 'documents',
+        group_payloads: { [groupId]: 'group_blob' },
+      });
+      await service.syncRecords(APP, auth(OWNER_PK), [r]);
+      await addGroupMembership(APP, groupId, DELEGATE_PK);
+      await grantRecordGroupAccess(APP, r.record_id, groupId, false, 'documents');
+
+      const result = await service.checkChanges(APP, auth(DELEGATE_PK), ['documents']);
+
+      expect(result.changed).toBe(true);
+      expect(result.changes.documents.changed_count).toBe(1);
+      expect(result.changes.documents.latest_created_at).not.toBeNull();
+    });
+  });
+
   // ══════════════════════════════════════════════════════════════
   //  DELEGATED FETCH
   // ══════════════════════════════════════════════════════════════
@@ -616,6 +883,61 @@ describe('RecordsService v3', () => {
       const fetched = await service.fetchDelegatedRecords(APP, DELEGATE_PK);
       expect(fetched.records).toHaveLength(0);
     });
+
+    test('returns group payload when caller is group member with record read access', async () => {
+      const groupId = crypto.randomUUID();
+      const r = record({
+        group_payloads: { [groupId]: 'group_blob_A' },
+      });
+      await service.syncRecords(APP, auth(OWNER_PK), [r]);
+      await addGroupMembership(APP, groupId, DELEGATE_PK);
+      await grantRecordGroupAccess(APP, r.record_id, groupId, false);
+
+      const fetched = await service.fetchDelegatedRecords(APP, DELEGATE_PK);
+      expect(fetched.records).toHaveLength(1);
+      expect(fetched.records[0].record_id).toBe(r.record_id);
+      expect(fetched.records[0].access_mode).toBe('group');
+      expect(fetched.records[0].group_id).toBe(groupId);
+      expect(fetched.records[0].group_payload).toBe('group_blob_A');
+      expect(fetched.records[0].can_write).toBe(false);
+      expect(fetched.records[0].delegate_payload).toBeUndefined();
+    });
+
+    test('returns can_write=true when caller is group member with record write access', async () => {
+      const groupId = crypto.randomUUID();
+      const r = record({
+        group_payloads: { [groupId]: 'group_blob_write' },
+      });
+      await service.syncRecords(APP, auth(OWNER_PK), [r]);
+      await addGroupMembership(APP, groupId, DELEGATE_PK);
+      await grantRecordGroupAccess(APP, r.record_id, groupId, true);
+
+      const fetched = await service.fetchDelegatedRecords(APP, DELEGATE_PK);
+
+      expect(fetched.records).toHaveLength(1);
+      expect(fetched.records[0].access_mode).toBe('group');
+      expect(fetched.records[0].can_write).toBe(true);
+      expect(fetched.records[0].group_id).toBe(groupId);
+      expect(fetched.records[0].group_payload).toBe('group_blob_write');
+    });
+
+    test('prefers delegate payload over group payload when both are available', async () => {
+      const groupId = crypto.randomUUID();
+      const r = record({
+        delegate_payloads: { [DELEGATE_PK]: 'delegate_blob' },
+        group_payloads: { [groupId]: 'group_blob' },
+      });
+      await service.syncRecords(APP, auth(OWNER_PK), [r]);
+      await addGroupMembership(APP, groupId, DELEGATE_PK);
+      await grantRecordGroupAccess(APP, r.record_id, groupId, true);
+
+      const fetched = await service.fetchDelegatedRecords(APP, DELEGATE_PK);
+      expect(fetched.records).toHaveLength(1);
+      expect(fetched.records[0].access_mode).toBe('delegate');
+      expect(fetched.records[0].delegate_payload).toBe('delegate_blob');
+      expect(fetched.records[0].group_payload).toBeUndefined();
+    });
+
   });
 
   // ══════════════════════════════════════════════════════════════
@@ -716,6 +1038,30 @@ describe('RecordsService v3', () => {
 
       expect(result.rejected).toHaveLength(1);
       expect(result.rejected[0].reason).toBe('no_permission');
+    });
+
+    test('group member with record-level write access is allowed to update', async () => {
+      const groupId = crypto.randomUUID();
+      const r = record({
+        collection: 'default',
+        group_payloads: { [groupId]: 'group_blob_v1' },
+      });
+      await service.syncRecords(APP, auth(OWNER_PK), [r]);
+      await addGroupMembership(APP, groupId, OTHER_PK);
+      await grantRecordGroupAccess(APP, r.record_id, groupId, true);
+
+      const result = await service.syncRecords(APP, auth(OTHER_PK), [
+        {
+          ...r,
+          encrypted_data: 'group_member_update',
+          encrypted_from: OTHER_PK,
+          group_payloads: { [groupId]: 'group_blob_v2' },
+        },
+      ]);
+
+      expect(result.synced).toHaveLength(1);
+      expect(result.synced[0].version).toBe(2);
+      expect(result.rejected).toHaveLength(0);
     });
 
     test('non-owner with write delegation is allowed to update', async () => {

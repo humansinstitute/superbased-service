@@ -12,6 +12,7 @@ import type { AuthContext } from '../types';
 
 const MEMBERS_TABLE = 'superbased_group_members';
 const REQUESTS_TABLE = 'superbased_group_requests';
+const GROUPS_TABLE = 'superbased_groups';
 const TEST_RUN_ID = process.env.FLUX_TEST_RUN_ID || 'local';
 const APP = `test_groups_app_${TEST_RUN_ID}`;
 
@@ -32,6 +33,20 @@ let service: GroupsService;
 
 beforeAll(async () => {
   const sql = getDb();
+
+  await sql`
+    CREATE TABLE IF NOT EXISTS ${sql(GROUPS_TABLE)} (
+      id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+      app_pubkey      text NOT NULL,
+      group_id        uuid NOT NULL,
+      group_name      text NOT NULL,
+      group_pubkey    text NOT NULL,
+      owner_pubkey    text NOT NULL,
+      created_at      timestamptz NOT NULL DEFAULT now(),
+      updated_at      timestamptz NOT NULL DEFAULT now(),
+      archived_at     timestamptz
+    )
+  `;
 
   await sql`
     CREATE TABLE IF NOT EXISTS ${sql(MEMBERS_TABLE)} (
@@ -70,6 +85,9 @@ beforeAll(async () => {
     ON ${sql(MEMBERS_TABLE)} (app_pubkey, group_id, member_pubkey)
     WHERE revoked_at IS NULL`;
 
+  await sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_groups_identity
+    ON ${sql(GROUPS_TABLE)} (app_pubkey, group_id)`;
+
   await sql`CREATE UNIQUE INDEX IF NOT EXISTS uq_group_requests_pending
     ON ${sql(REQUESTS_TABLE)} (app_pubkey, group_id, requester_pubkey)
     WHERE status = 'pending'`;
@@ -81,6 +99,7 @@ beforeEach(async () => {
   const sql = getDb();
   await sql`DELETE FROM ${sql(REQUESTS_TABLE)} WHERE app_pubkey = ${APP}`;
   await sql`DELETE FROM ${sql(MEMBERS_TABLE)} WHERE app_pubkey = ${APP}`;
+  await sql`DELETE FROM ${sql(GROUPS_TABLE)} WHERE app_pubkey = ${APP}`;
 });
 
 afterAll(async () => {

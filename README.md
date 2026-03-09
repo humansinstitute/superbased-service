@@ -49,6 +49,8 @@ curl http://localhost:3080/health
 
 Notes:
 - If `POSTGRES_URL` is unset, compose uses bundled Postgres: `postgres://postgres:postgres@postgres:5432/fluxbase`
+- Running `bun run init` from host shell supports docker-style hostnames: if `POSTGRES_URL` uses `@postgres`, CLI auto-falls back to `@localhost`.
+- Compose exposes Postgres on `${POSTGRES_HOST_PORT:-55432}` for host-side CLIs.
 - Data persists in `postgres_data` volume
 - Object storage persists in `minio_data` volume
 - Use `STORAGE_S3_ENDPOINT` for internal backend-to-MinIO access (compose default: `http://minio:9000`)
@@ -67,6 +69,7 @@ Notes:
 | `NIP98_MAX_AGE_SECONDS` | Max accepted NIP-98 auth event age | `60` |
 | `SERVICE_TOKEN` | Optional Bearer token for service-level access | - |
 | `POSTGRES_URL` | Postgres connection URL | `postgres://postgres:postgres@localhost:5432/fluxbase` |
+| `POSTGRES_HOST_PORT` | Host port mapped to compose Postgres | `55432` |
 | `LOG_LEVEL` | Log level | `info` |
 | `PUSH_ENABLED` | Enable Web Push features | `false` |
 | `PUSH_VAPID_PUBLIC_KEY` | Web Push VAPID public key | - |
@@ -113,6 +116,7 @@ Core endpoints:
 - Apps: `POST /apps/register`, `GET /apps`, `GET /apps/:appNpub`, `POST /apps/:appNpub/token`
 - Delegations: `POST /delegations`, `GET /delegations`, `DELETE /delegations/:delegateNpub`
 - App delegations: `POST /apps/:appNpub/delegate`, `GET /apps/:appNpub/delegations`, `DELETE /apps/:appNpub/delegate/:delegateNpub`
+- Groups: `POST /groups`, `GET /groups`, `GET /groups/:groupId/members`, `POST /groups/:groupId/members`, `DELETE /groups/:groupId/members/:memberNpub`, `POST /groups/:groupId/requests`, `GET /groups/:groupId/requests`, `PATCH /groups/:groupId/requests/:requestId`
 - Push (default namespace + app namespace): `/push/*`, `/apps/:appNpub/push/*`
 - Records (default namespace): `POST /records/sync`, `GET /records/fetch`, `GET /records/delegated`, `GET /records/history/:recordId`, `DELETE /records?record_id=...`
 - Records (per-app namespace): `POST /records/:appNpub/sync`, `GET /records/:appNpub/fetch`, `GET /records/:appNpub/delegated`, `GET /records/:appNpub/history/:recordId`, `DELETE /records/:appNpub?record_id=...`
@@ -142,6 +146,21 @@ Stubbed (not implemented):
 - `db_query`, `db_insert`, `db_update`, `db_delete`
 - `storage_upload`, `storage_download`, `storage_list`, `storage_delete`
 - `function_invoke`
+
+## Groups + Record Crypto Contract
+
+- Canonical group definitions live in `superbased_groups` (one row per group).
+- Membership + per-member wrapped group keys live in `superbased_group_members` (one row per active member).
+- Join workflow state lives in `superbased_group_requests`.
+- Group APIs distribute per-member encrypted group keys (`encrypted_group_key`) for membership management.
+- Record access is still enforced by record-level crypto metadata (`delegate_payloads`) and delegated fetch filtering.
+- A pubkey can decrypt delegated data only when the record contains `delegate_payloads[that_pubkey]`.
+
+For group sharing flows, the client should:
+1. Resolve group members via `/groups/:groupId/members`
+2. Encrypt record payload per member pubkey
+3. Submit those blobs under `delegate_payloads` during `/records/sync`
+4. Delegates read via `/records/delegated` and decrypt their singular `delegate_payload`
 
 ## Testing
 

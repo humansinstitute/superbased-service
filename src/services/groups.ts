@@ -14,6 +14,19 @@ import type {
 
 const MEMBERS_TABLE = 'superbased_group_members';
 const REQUESTS_TABLE = 'superbased_group_requests';
+const GROUPS_TABLE = 'superbased_groups';
+
+interface GroupRecord {
+  id: string;
+  app_pubkey: string;
+  group_id: string;
+  group_name: string;
+  group_pubkey: string;
+  owner_pubkey: string;
+  created_at: string;
+  updated_at?: string | null;
+  archived_at?: string | null;
+}
 
 function safeISODate(val: unknown): string | null {
   if (val instanceof Date) {
@@ -53,7 +66,7 @@ function normalizeStatus(status?: string): GroupRequestStatus | undefined {
 }
 
 export class GroupsService {
-  private async getGroupSeed(appPubkey: string, groupId: string): Promise<GroupMember | null> {
+  private async getLegacyGroupSeed(appPubkey: string, groupId: string): Promise<GroupMember | null> {
     const sql = getDb();
     const rows = await sql`
       SELECT id, app_pubkey, group_id::text as group_id, group_name, group_pubkey, owner_pubkey,
@@ -70,6 +83,60 @@ export class GroupsService {
 
     if (rows.length === 0) return null;
     return rows[0] as unknown as GroupMember;
+  }
+
+  private async getGroupRecord(appPubkey: string, groupId: string): Promise<GroupRecord | null> {
+    const sql = getDb();
+    const rows = await sql`
+      SELECT id, app_pubkey, group_id::text as group_id, group_name, group_pubkey, owner_pubkey,
+             created_at::text as created_at, updated_at::text as updated_at, archived_at::text as archived_at
+      FROM ${sql(GROUPS_TABLE)}
+      WHERE app_pubkey = ${appPubkey}
+        AND group_id = ${groupId}::uuid
+        AND archived_at IS NULL
+      LIMIT 1
+    `;
+    return rows.length > 0 ? (rows[0] as unknown as GroupRecord) : null;
+  }
+
+  // Transitional helper: if a legacy deployment has member rows but no groups row,
+  // backfill the canonical group row from the owner seed.
+  private async getGroup(appPubkey: string, groupId: string): Promise<GroupRecord | null> {
+    const existing = await this.getGroupRecord(appPubkey, groupId);
+    if (existing) return existing;
+
+    const seed = await this.getLegacyGroupSeed(appPubkey, groupId);
+    if (!seed) return null;
+
+    const sql = getDb();
+    await sql`
+      INSERT INTO ${sql(GROUPS_TABLE)} (
+        app_pubkey, group_id, group_name, group_pubkey, owner_pubkey
+      ) VALUES (
+        ${appPubkey}, ${groupId}::uuid, ${seed.group_name}, ${seed.group_pubkey}, ${seed.owner_pubkey}
+      )
+      ON CONFLICT (app_pubkey, group_id)
+      DO UPDATE SET
+        group_name = EXCLUDED.group_name,
+        group_pubkey = EXCLUDED.group_pubkey,
+        owner_pubkey = EXCLUDED.owner_pubkey,
+        archived_at = NULL,
+        updated_at = now()
+    `;
+
+    const backfilled = await this.getGroupRecord(appPubkey, groupId);
+    if (backfilled) return backfilled;
+    return {
+      id: seed.id,
+      app_pubkey: appPubkey,
+      group_id: groupId,
+      group_name: seed.group_name,
+      group_pubkey: seed.group_pubkey,
+      owner_pubkey: seed.owner_pubkey,
+      created_at: safeISODate(seed.created_at) || new Date().toISOString(),
+      updated_at: safeISODate(seed.updated_at),
+      archived_at: null,
+    };
   }
 
   private async getActiveMembership(
@@ -122,21 +189,39 @@ export class GroupsService {
 
     const groupId = crypto.randomUUID();
     const sql = getDb();
+    const groupName = input.group_name.trim();
+    const groupPubkey = input.group_pubkey.trim();
+    const encryptedGroupKey = input.encrypted_group_key.trim();
+
+    await sql`
+      INSERT INTO ${sql(GROUPS_TABLE)} (
+        app_pubkey, group_id, group_name, group_pubkey, owner_pubkey
+      ) VALUES (
+        ${appPubkey}, ${groupId}::uuid, ${groupName}, ${groupPubkey}, ${auth.pubkey}
+      )
+      ON CONFLICT (app_pubkey, group_id)
+      DO UPDATE SET
+        group_name = EXCLUDED.group_name,
+        group_pubkey = EXCLUDED.group_pubkey,
+        owner_pubkey = EXCLUDED.owner_pubkey,
+        archived_at = NULL,
+        updated_at = now()
+    `;
 
     await sql`
       INSERT INTO ${sql(MEMBERS_TABLE)} (
         app_pubkey, group_id, group_name, group_pubkey, owner_pubkey,
         member_pubkey, encrypted_group_key, role, invited_by, joined_at
       ) VALUES (
-        ${appPubkey}, ${groupId}::uuid, ${input.group_name.trim()}, ${input.group_pubkey.trim()},
-        ${auth.pubkey}, ${auth.pubkey}, ${input.encrypted_group_key.trim()}, 'owner', NULL, now()
+        ${appPubkey}, ${groupId}::uuid, ${groupName}, ${groupPubkey},
+        ${auth.pubkey}, ${auth.pubkey}, ${encryptedGroupKey}, 'owner', NULL, now()
       )
     `;
 
     return {
       group_id: groupId,
-      group_name: input.group_name.trim(),
-      group_pubkey: input.group_pubkey.trim(),
+      group_name: groupName,
+      group_pubkey: groupPubkey,
       owner_pubkey: auth.pubkey,
       my_role: 'owner',
       joined_at: new Date().toISOString(),
@@ -146,13 +231,21 @@ export class GroupsService {
   async listMyGroups(appPubkey: string, auth: AuthContext): Promise<GroupSummary[]> {
     const sql = getDb();
     const rows = await sql`
-      SELECT group_id::text as group_id, group_name, group_pubkey, owner_pubkey, role,
-             joined_at::text as joined_at
-      FROM ${sql(MEMBERS_TABLE)}
-      WHERE app_pubkey = ${appPubkey}
-        AND member_pubkey = ${auth.pubkey}
-        AND revoked_at IS NULL
-      ORDER BY updated_at DESC
+      SELECT m.group_id::text as group_id,
+             COALESCE(g.group_name, m.group_name) as group_name,
+             COALESCE(g.group_pubkey, m.group_pubkey) as group_pubkey,
+             COALESCE(g.owner_pubkey, m.owner_pubkey) as owner_pubkey,
+             m.role,
+             m.joined_at::text as joined_at
+      FROM ${sql(MEMBERS_TABLE)} m
+      LEFT JOIN ${sql(GROUPS_TABLE)} g
+        ON g.app_pubkey = m.app_pubkey
+       AND g.group_id = m.group_id
+       AND g.archived_at IS NULL
+      WHERE m.app_pubkey = ${appPubkey}
+        AND m.member_pubkey = ${auth.pubkey}
+        AND m.revoked_at IS NULL
+      ORDER BY m.updated_at DESC
     `;
 
     return rows.map((r: any) => ({
@@ -167,24 +260,31 @@ export class GroupsService {
 
   async listGroupMembers(appPubkey: string, auth: AuthContext, groupId: string): Promise<GroupMember[]> {
     await this.requireGroupMember(appPubkey, groupId, auth.pubkey);
+    const group = await this.getGroup(appPubkey, groupId);
+    if (!group) {
+      throw new Error('Group not found');
+    }
     const sql = getDb();
     const rows = await sql`
-      SELECT id, app_pubkey, group_id::text as group_id, group_name, group_pubkey, owner_pubkey,
-             member_pubkey, encrypted_group_key, role, invited_by,
-             joined_at::text as joined_at, created_at::text as created_at,
-             updated_at::text as updated_at, revoked_at::text as revoked_at
-      FROM ${sql(MEMBERS_TABLE)}
-      WHERE app_pubkey = ${appPubkey}
-        AND group_id = ${groupId}::uuid
-        AND revoked_at IS NULL
+      SELECT m.id, m.app_pubkey, m.group_id::text as group_id,
+             ${group.group_name} as group_name,
+             ${group.group_pubkey} as group_pubkey,
+             ${group.owner_pubkey} as owner_pubkey,
+             m.member_pubkey, m.encrypted_group_key, m.role, m.invited_by,
+             m.joined_at::text as joined_at, m.created_at::text as created_at,
+             m.updated_at::text as updated_at, m.revoked_at::text as revoked_at
+      FROM ${sql(MEMBERS_TABLE)} m
+      WHERE m.app_pubkey = ${appPubkey}
+        AND m.group_id = ${groupId}::uuid
+        AND m.revoked_at IS NULL
       ORDER BY
-        CASE role
+        CASE m.role
           WHEN 'owner' THEN 0
           WHEN 'admin' THEN 1
           WHEN 'member' THEN 2
           ELSE 3
         END,
-        created_at ASC
+        m.created_at ASC
     `;
 
     return rows as unknown as GroupMember[];
@@ -204,8 +304,8 @@ export class GroupsService {
 
     const role = normalizeRole(input.role);
     const memberPubkey = decodeNpub(input.member_npub);
-    const seed = await this.getGroupSeed(appPubkey, groupId);
-    if (!seed) {
+    const group = await this.getGroup(appPubkey, groupId);
+    if (!group) {
       throw new Error('Group not found');
     }
 
@@ -218,9 +318,9 @@ export class GroupsService {
         SET encrypted_group_key = ${input.encrypted_group_key.trim()},
             role = ${role},
             invited_by = ${auth.pubkey},
-            group_name = ${seed.group_name},
-            group_pubkey = ${seed.group_pubkey},
-            owner_pubkey = ${seed.owner_pubkey},
+            group_name = ${group.group_name},
+            group_pubkey = ${group.group_pubkey},
+            owner_pubkey = ${group.owner_pubkey},
             joined_at = COALESCE(joined_at, now()),
             revoked_at = NULL,
             updated_at = now()
@@ -238,7 +338,7 @@ export class GroupsService {
         app_pubkey, group_id, group_name, group_pubkey, owner_pubkey,
         member_pubkey, encrypted_group_key, role, invited_by, joined_at
       ) VALUES (
-        ${appPubkey}, ${groupId}::uuid, ${seed.group_name}, ${seed.group_pubkey}, ${seed.owner_pubkey},
+        ${appPubkey}, ${groupId}::uuid, ${group.group_name}, ${group.group_pubkey}, ${group.owner_pubkey},
         ${memberPubkey}, ${input.encrypted_group_key.trim()}, ${role}, ${auth.pubkey}, now()
       )
       RETURNING id, app_pubkey, group_id::text as group_id, group_name, group_pubkey, owner_pubkey,
@@ -278,8 +378,8 @@ export class GroupsService {
       throw new Error('invite_secret is required');
     }
 
-    const seed = await this.getGroupSeed(appPubkey, groupId);
-    if (!seed) {
+    const group = await this.getGroup(appPubkey, groupId);
+    if (!group) {
       throw new Error('Group not found');
     }
 
@@ -390,8 +490,8 @@ export class GroupsService {
     }
 
     const role = normalizeRole(input.role);
-    const seed = await this.getGroupSeed(appPubkey, groupId);
-    if (!seed) {
+    const group = await this.getGroup(appPubkey, groupId);
+    if (!group) {
       throw new Error('Group not found');
     }
 
@@ -402,9 +502,9 @@ export class GroupsService {
         SET encrypted_group_key = ${input.member_encrypted_group_key!.trim()},
             role = ${role},
             invited_by = ${auth.pubkey},
-            group_name = ${seed.group_name},
-            group_pubkey = ${seed.group_pubkey},
-            owner_pubkey = ${seed.owner_pubkey},
+            group_name = ${group.group_name},
+            group_pubkey = ${group.group_pubkey},
+            owner_pubkey = ${group.owner_pubkey},
             joined_at = COALESCE(joined_at, now()),
             revoked_at = NULL,
             updated_at = now()
@@ -422,7 +522,7 @@ export class GroupsService {
         app_pubkey, group_id, group_name, group_pubkey, owner_pubkey,
         member_pubkey, encrypted_group_key, role, invited_by, joined_at
       ) VALUES (
-        ${appPubkey}, ${groupId}::uuid, ${seed.group_name}, ${seed.group_pubkey}, ${seed.owner_pubkey},
+        ${appPubkey}, ${groupId}::uuid, ${group.group_name}, ${group.group_pubkey}, ${group.owner_pubkey},
         ${request.requester_pubkey}, ${input.member_encrypted_group_key!.trim()}, ${role}, ${auth.pubkey}, now()
       )
       RETURNING id, app_pubkey, group_id::text as group_id, group_name, group_pubkey, owner_pubkey,
